@@ -57,7 +57,10 @@ async function saveNotification({ userId, title, body, type, targetId, senderNam
 // HELPER: Send FCM and save notifications
 // ==========================================
 async function sendFCMAndSave({ tokens, userIds, title, body, data, type, targetId, senderName }) {
-  if (!tokens || tokens.length === 0) {
+  const uniqueTokens = [...new Set(tokens || [])];
+  const uniqueUserIds = [...new Set(userIds || [])];
+
+  if (uniqueTokens.length === 0) {
     console.log('⚠️ No tokens to send to');
     return { sent: 0, saved: 0 };
   }
@@ -82,11 +85,11 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
         headers: { 'apns-priority': '10' }, // أولوية قصوى لآبل
         payload: { aps: { contentAvailable: true, sound: 'default' } }
       },
-      tokens
+      tokens: uniqueTokens
     };
     const response = await admin.messaging().sendEachForMulticast(payload);
     sent = response.successCount;
-    console.log(`📲 FCM sent: ${sent}/${tokens.length} successful`);
+    console.log(`📲 FCM sent: ${sent}/${uniqueTokens.length} successful`);
 
     // Log failures
     response.responses.forEach((resp, idx) => {
@@ -99,8 +102,8 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
   }
 
   // Save to Firestore for each user
-  if (userIds && userIds.length > 0) {
-    for (const uid of userIds) {
+  if (uniqueUserIds && uniqueUserIds.length > 0) {
+    for (const uid of uniqueUserIds) {
       await saveNotification({ userId: uid, title, body, type, targetId, senderName });
       saved++;
     }
