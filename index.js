@@ -348,23 +348,29 @@ app.post('/send-notification', async (req, res) => {
 });
 
 // ==========================================
-// 7. Upload Image
+// 7. Upload Image (JSON Base64 Mode)
 // ==========================================
-app.post('/upload-image', upload.single('image'), async (req, res) => {
+app.post('/upload-image', async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ error: 'No image' });
+    const { image } = req.body;
+    if (!image) return res.status(400).json({ error: 'No image provided' });
     const apiKey = process.env.IMAGEBB_API_KEY;
     if (!apiKey) return res.status(500).json({ error: 'IMAGEBB_API_KEY missing' });
 
+    // Clean base64 string (remove data:image/png;base64, prefix if exists)
+    const base64Data = image.replace(/^data:image\/\w+;base64,/, "");
+
     const formData = new FormData();
-    formData.append('image', req.file.buffer.toString('base64'));
+    formData.append('image', base64Data);
 
     const response = await axios.post(`https://api.imgbb.com/1/upload?key=${apiKey}`, formData, {
       headers: formData.getHeaders()
     });
+    console.log(`📸 Image uploaded via ImgBB:`, response.data.data.url);
     res.json({ success: true, url: response.data.data.url });
   } catch (err) {
-    res.status(500).json({ error: 'Upload failed' });
+    console.error('❌ Upload failed:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Upload failed', details: err.message });
   }
 });
 
