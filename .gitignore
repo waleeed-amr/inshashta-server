@@ -1,0 +1,5 @@
+node_modules/
+.env
+app-loction-5-firebase-adminsdk-fbsvc-d43e43975e.json
+serviceAccountKey.json
+*.log
