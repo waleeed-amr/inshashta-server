@@ -169,34 +169,46 @@ app.post('/api/notify-message', async (req, res) => {
       }
       chatName = senderName;
     } else if (isGroup) {
-      // Group Chat: get all members' tokens
+      // Group Chat: get all members' tokens via batch get
       const groupId = matchId.replace('group_', '');
       const groupDoc = await db.collection('Groups').doc(groupId).get();
       if (!groupDoc.exists) return res.json({ success: true, sent: 0, reason: 'Group not found' });
       const groupData = groupDoc.data();
       chatName = groupData.name || 'Group';
 
-      for (let memberId of (groupData.members || [])) {
-        if (memberId === senderId) continue;
-        const mDoc = await db.collection('Users').doc(memberId).get();
-        if (mDoc.exists && mDoc.data().fcmToken) {
-          tokens.push(mDoc.data().fcmToken);
-          userIds.push(memberId);
+      const memberIds = (groupData.members || []).filter(id => id !== senderId);
+      if (memberIds.length > 0) {
+        // Fetch up to 100 users at once (Firestore limit for getAll)
+        // Usually groups don't exceed 100, if so, we can batch it, but safe for now.
+        const refs = memberIds.slice(0, 100).map(id => db.collection('Users').doc(id));
+        if (refs.length > 0) {
+          const docs = await db.getAll(...refs);
+          docs.forEach(mDoc => {
+            if (mDoc.exists && mDoc.data().fcmToken) {
+              tokens.push(mDoc.data().fcmToken);
+              userIds.push(mDoc.id);
+            }
+          });
         }
       }
     } else {
-      // Match Chat: get all players' tokens
+      // Match Chat: get all players' tokens via batch get
       const matchDoc = await db.collection('Matches').doc(matchId).get();
       if (!matchDoc.exists) return res.json({ success: true, sent: 0, reason: 'Match not found' });
       const matchData = matchDoc.data();
       chatName = matchData.name || 'Match';
 
-      for (let pid of (matchData.players || [])) {
-        if (pid === senderId) continue;
-        const pDoc = await db.collection('Users').doc(pid).get();
-        if (pDoc.exists && pDoc.data().fcmToken) {
-          tokens.push(pDoc.data().fcmToken);
-          userIds.push(pid);
+      const pIds = (matchData.players || []).filter(id => id !== senderId);
+      if (pIds.length > 0) {
+        const refs = pIds.slice(0, 100).map(id => db.collection('Users').doc(id));
+        if (refs.length > 0) {
+          const docs = await db.getAll(...refs);
+          docs.forEach(pDoc => {
+            if (pDoc.exists && pDoc.data().fcmToken) {
+              tokens.push(pDoc.data().fcmToken);
+              userIds.push(pDoc.id);
+            }
+          });
         }
       }
     }
@@ -349,100 +361,7 @@ app.post('/api/broadcast', async (req, res) => {
   }
 });
 
-// ==========================================
-// 4. Reply from Notification (inline reply)
-// ==========================================
-app.post('/api/reply-message', async (req, res) => {
-  try {
-    if (!db) return res.status(500).json({ error: 'DB not available' });
-    const { matchId, senderId, text } = req.body;
-    if (!matchId || !senderId || !text) {
-      return res.status(400).json({ error: 'matchId, senderId, and text required' });
-    }
-
-    console.log(`\n💬 Reply from notification: matchId=${matchId}, senderId=${senderId}`);
-
-    // Save the reply message to Firestore
-    await db.collection('Messages').add({
-      matchId,
-      senderId,
-      text,
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    // Get sender info
-    const senderDoc = await db.collection('Users').doc(senderId).get();
-    const senderName = senderDoc.exists ? senderDoc.data().name : 'User';
-    const senderAvatar = senderDoc.exists ? (senderDoc.data().avatarUrl || '') : '';
-
-    // Now notify other participants
-    const isDM = matchId.startsWith('dm_');
-    const isGroup = matchId.startsWith('group_');
-    const tokens = [];
-    const userIds = [];
-    let chatName = '';
-
-    if (isDM) {
-      const parts = matchId.replace('dm_', '').split('_');
-      const otherUid = parts.find(p => p !== senderId);
-      if (otherUid) {
-        const otherDoc = await db.collection('Users').doc(otherUid).get();
-        if (otherDoc.exists && otherDoc.data().fcmToken) {
-          tokens.push(otherDoc.data().fcmToken);
-          userIds.push(otherUid);
-        }
-      }
-      chatName = senderName;
-    } else if (isGroup) {
-      const groupId = matchId.replace('group_', '');
-      const groupDoc = await db.collection('Groups').doc(groupId).get();
-      if (groupDoc.exists) {
-        const groupData = groupDoc.data();
-        chatName = groupData.name || 'Group';
-        for (let memberId of (groupData.members || [])) {
-          if (memberId === senderId) continue;
-          const mDoc = await db.collection('Users').doc(memberId).get();
-          if (mDoc.exists && mDoc.data().fcmToken) {
-            tokens.push(mDoc.data().fcmToken);
-            userIds.push(memberId);
-          }
-        }
-      }
-    } else {
-      const matchDoc = await db.collection('Matches').doc(matchId).get();
-      if (matchDoc.exists) {
-        const matchData = matchDoc.data();
-        chatName = matchData.name || 'Match';
-        for (let pid of (matchData.players || [])) {
-          if (pid === senderId) continue;
-          const pDoc = await db.collection('Users').doc(pid).get();
-          if (pDoc.exists && pDoc.data().fcmToken) {
-            tokens.push(pDoc.data().fcmToken);
-            userIds.push(pid);
-          }
-        }
-      }
-    }
-
-    const title = isDM ? senderName : chatName;
-    const body = isDM ? text : `${senderName}: ${text}`;
-    const msgType = isDM ? 'dm_message' : (isGroup ? 'group_message' : 'chat_message');
-
-    if (tokens.length > 0) {
-      await sendFCMAndSave({
-        tokens, userIds, title, body,
-        data: { matchId, type: msgType, chatName },
-        type: msgType, targetId: matchId,
-        senderName, senderAvatar
-      });
-    }
-
-    res.json({ success: true, message: 'Reply sent and saved' });
-  } catch (err) {
-    console.error('[Reply Message Error]', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
+// API Reply Message was removed since native inline reply has been disabled in Android notification
 
 // ==========================================
 // 5. Mark notification as read
