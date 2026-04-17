@@ -3,12 +3,11 @@ const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const axios = require('axios');
-const FormData = require('form-data');
 require('dotenv').config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
@@ -56,8 +55,7 @@ async function saveNotification({ userId, title, body, type, targetId, senderNam
 
 // ==========================================
 // HELPER: Send FCM (DATA-ONLY) and save notifications
-// Now sends data-only messages so native Android service
-// can build rich notifications with sender photo + reply action
+// Optimized: FCM is sent FIRST, Firestore saves run in parallel AFTER
 // ==========================================
 async function sendFCMAndSave({ tokens, userIds, title, body, data, type, targetId, senderName, senderAvatar }) {
   const uniqueTokens = [...new Set(tokens || [])];
@@ -69,10 +67,8 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
   }
 
   let sent = 0;
-  let saved = 0;
 
-  // Send FCM - DATA ONLY (no notification key!)
-  // This ensures our custom MyFirebaseMessagingService handles display
+  // ========== STEP 1: Send FCM IMMEDIATELY (highest priority) ==========
   try {
     const payload = {
       data: {
@@ -87,7 +83,7 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
       },
       android: {
         priority: 'high',
-        ttl: 0, // اختراق السكون (Doze mode) للإرسال الفوري
+        ttl: 0,
       },
       apns: {
         headers: { 'apns-priority': '10' },
@@ -105,21 +101,38 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
     sent = response.successCount;
     console.log(`📲 FCM sent: ${sent}/${uniqueTokens.length} successful`);
 
-    // Log failures
+    // Log failures and clean up invalid tokens
     response.responses.forEach((resp, idx) => {
       if (!resp.success) {
         console.error(`  ❌ Token[${idx}] failed:`, resp.error?.message);
+        // Auto-cleanup invalid tokens
+        const errCode = resp.error?.code;
+        if (errCode === 'messaging/invalid-registration-token' ||
+            errCode === 'messaging/registration-token-not-registered') {
+          console.log(`  🧹 Removing invalid token for user index ${idx}`);
+          if (uniqueUserIds[idx] && db) {
+            db.collection('Users').doc(uniqueUserIds[idx]).update({
+              fcmToken: admin.firestore.FieldValue.delete()
+            }).catch(() => {});
+          }
+        }
       }
     });
   } catch (err) {
     console.error('❌ FCM send error:', err.message);
   }
 
-  // Save to Firestore for each user
+  // ========== STEP 2: Save to Firestore IN PARALLEL (non-blocking for response) ==========
+  let saved = 0;
   if (uniqueUserIds && uniqueUserIds.length > 0) {
-    for (const uid of uniqueUserIds) {
-      await saveNotification({ userId: uid, title, body, type, targetId, senderName, senderAvatar });
-      saved++;
+    try {
+      const savePromises = uniqueUserIds.map(uid =>
+        saveNotification({ userId: uid, title, body, type, targetId, senderName, senderAvatar })
+      );
+      const results = await Promise.allSettled(savePromises);
+      saved = results.filter(r => r.status === 'fulfilled' && r.value).length;
+    } catch (err) {
+      console.error('❌ Batch save error:', err.message);
     }
   }
 
@@ -130,9 +143,14 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
 // API ROUTES
 // ==========================================
 
-// Health check
-app.get('/', (req, res) => res.json({ status: 'Server is running', version: '4.0.0' }));
-app.get('/api', (req, res) => res.json({ status: 'Server is running', version: '4.0.0' }));
+// Health check + warm-up endpoint (prevents Vercel cold start)
+app.get('/', (req, res) => res.json({ status: 'Server is running', version: '4.0.0', ts: Date.now() }));
+app.get('/api', (req, res) => res.json({ status: 'Server is running', version: '4.0.0', ts: Date.now() }));
+
+// Dedicated warm-up endpoint (called on app launch to prevent cold start delay)
+app.get('/api/warm', (req, res) => {
+  res.json({ warm: true, ts: Date.now() });
+});
 
 // ==========================================
 // 1. Notify Message - Chat, DM & Group notifications
@@ -178,8 +196,6 @@ app.post('/api/notify-message', async (req, res) => {
 
       const memberIds = (groupData.members || []).filter(id => id !== senderId);
       if (memberIds.length > 0) {
-        // Fetch up to 100 users at once (Firestore limit for getAll)
-        // Usually groups don't exceed 100, if so, we can batch it, but safe for now.
         const refs = memberIds.slice(0, 100).map(id => db.collection('Users').doc(id));
         if (refs.length > 0) {
           const docs = await db.getAll(...refs);
@@ -439,11 +455,12 @@ app.post('/upload-image', async (req, res) => {
     // Clean base64 string (remove data:image/png;base64, prefix if exists)
     const base64Data = image.replace(/^data:image\/\w+;base64,/, "");
 
-    const formData = new FormData();
-    formData.append('image', base64Data);
+    // Use URLSearchParams instead of form-data package (works natively in Node 18+)
+    const params = new URLSearchParams();
+    params.append('image', base64Data);
 
-    const response = await axios.post(`https://api.imgbb.com/1/upload?key=${apiKey}`, formData, {
-      headers: formData.getHeaders()
+    const response = await axios.post(`https://api.imgbb.com/1/upload?key=${apiKey}`, params, {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
     });
     console.log(`📸 Image uploaded via ImgBB:`, response.data.data.url);
     res.json({ success: true, url: response.data.data.url });
@@ -476,7 +493,64 @@ app.post('/mute-user', async (req, res) => {
 });
 
 // ==========================================
-// 10. Debug: Check server health
+// 10. Extract MediaFire Direct Link
+// ==========================================
+app.post('/api/mediafire-direct', async (req, res) => {
+  try {
+    const { url } = req.body;
+    if (!url || !url.includes('mediafire.com')) {
+      return res.status(400).json({ error: 'Invalid MediaFire URL format' });
+    }
+
+    console.log(`\n🔗 Extracting direct link from: ${url}`);
+    
+    // Fetch the HTML from MediaFire
+    const response = await axios.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36'
+      }
+    });
+    
+    const html = response.data;
+    
+    // Try to find the download button URL (usually id="downloadButton")
+    const regexps = [
+      /id="downloadButton" href="([^"]+)"/i,
+      /class="input pov" href="([^"]+)"/i,
+      /href="([^"]+)"\n\s*id="downloadButton"/i
+    ];
+
+    let directUrl = null;
+    for (const regex of regexps) {
+      const match = html.match(regex);
+      if (match && match[1]) {
+        directUrl = match[1];
+        break;
+      }
+    }
+
+    if (!directUrl) {
+       // Look for general download structure if the above fails
+       const fallbackMatch = html.match(/"([^"]+\.mediafire\.com\/download\/[^"]+)"/);
+       if (fallbackMatch && fallbackMatch[1]) directUrl = fallbackMatch[1];
+    }
+
+    if (directUrl) {
+      console.log('✅ Direct URL found');
+      return res.json({ success: true, url: directUrl.replace(/&amp;/g, '&') });
+    } else {
+      console.error('❌ Could not find direct URL in HTML');
+      return res.status(404).json({ error: 'Direct link not found' });
+    }
+    
+  } catch (err) {
+    console.error('[MediaFire Error]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==========================================
+// 11. Debug: Check server health
 // ==========================================
 app.get('/api/health', async (req, res) => {
   const health = {
