@@ -446,6 +446,7 @@ app.post('/api/call-invite', async (req, res) => {
       data: {
         matchId,
         type: 'call_invite',
+        callType: type || 'video_call',
         senderName: callerName,
         senderAvatar: callerAvatar
       },
