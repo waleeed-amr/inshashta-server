@@ -71,6 +71,10 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
   // ========== STEP 1: Send FCM IMMEDIATELY (highest priority) ==========
   try {
     const payload = {
+      notification: {
+        title: title || '',
+        body: body || ''
+      },
       data: {
         ...(data || {}),
         title: title || '',
@@ -84,6 +88,9 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
       android: {
         priority: 'high',
         ttl: 0,
+        notification: {
+          sound: 'default'
+        }
       },
       apns: {
         headers: { 'apns-priority': '10' },
@@ -144,8 +151,8 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
 // ==========================================
 
 // Health check + warm-up endpoint (prevents Vercel cold start)
-app.get('/', (req, res) => res.json({ status: 'Server is running', version: '4.0.0', ts: Date.now() }));
-app.get('/api', (req, res) => res.json({ status: 'Server is running', version: '4.0.0', ts: Date.now() }));
+app.get('/', (req, res) => res.json({ status: 'Server is running', version: '5.0.0', ts: Date.now() }));
+app.get('/api', (req, res) => res.json({ status: 'Server is running', version: '5.0.0', ts: Date.now() }));
 
 // Dedicated warm-up endpoint (called on app launch to prevent cold start delay)
 app.get('/api/warm', (req, res) => {
@@ -651,7 +658,7 @@ app.post('/api/mediafire-direct', async (req, res) => {
 app.get('/api/health', async (req, res) => {
   const health = {
     server: 'running',
-    version: '4.0.0',
+    version: '5.0.0',
     firebase: !!admin.apps.length,
     firestore: !!db,
     timestamp: new Date().toISOString()
