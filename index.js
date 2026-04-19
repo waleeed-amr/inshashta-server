@@ -440,25 +440,28 @@ app.post('/api/call-invite', async (req, res) => {
     const title = `📞 مكالمة واردة من ${callerName}`;
     const body = `اضغط للرد على المكالمة والانضمام`;
 
-    // 1- Send high-priority visible FCM notification to act like a ring
+    // CRITICAL: Send DATA-ONLY FCM (no "notification" key!)
+    // If "notification" key is present, Android handles it via system tray
+    // and onMessageReceived is NEVER called when app is killed/background.
+    // With data-only, onMessageReceived is ALWAYS called → IncomingCallActivity launches.
     const response = await admin.messaging().sendEachForMulticast({
-      notification: { title, body }, // We use visible notification so it wakes the device and shows in tray
       data: {
+        title,
+        body,
         matchId,
         type: 'call_invite',
         callType: type || 'video_call',
         senderName: callerName,
-        senderAvatar: callerAvatar
+        senderAvatar: callerAvatar,
+        timestamp: Date.now().toString()
       },
       android: {
         priority: 'high',
-        notification: {
-          channelId: 'in_shashta_calls', // Special channel to trigger ringing sounds
-          sound: 'default' 
-        }
+        ttl: 0,
       },
       apns: {
-         payload: { aps: { sound: 'default', category: 'CALL_INVITE' } }
+         headers: { 'apns-priority': '10' },
+         payload: { aps: { contentAvailable: true, sound: 'default', category: 'CALL_INVITE' } }
       },
       tokens
     });
