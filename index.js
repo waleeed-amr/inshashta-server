@@ -243,8 +243,8 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
 // ==========================================
 
 // Health check + warm-up endpoint (prevents Vercel cold start)
-app.get('/', (req, res) => res.json({ status: 'Server is running', version: '6.0.0', ts: Date.now() }));
-app.get('/api', (req, res) => res.json({ status: 'Server is running', version: '6.0.0', ts: Date.now() }));
+app.get('/', (req, res) => res.json({ status: 'Server is running', version: '6.1.0', ts: Date.now() }));
+app.get('/api', (req, res) => res.json({ status: 'Server is running', version: '6.1.0', ts: Date.now() }));
 
 // Dedicated warm-up endpoint (called on app launch to prevent cold start delay)
 app.get('/api/warm', (req, res) => {
@@ -557,6 +557,63 @@ app.post('/api/call-invite', async (req, res) => {
     res.json({ success: true, sent: response.successCount });
   } catch (err) {
     console.error('[Call Invite Error]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==========================================
+// 4b. Send Call Cancel (Silent Notification)
+// ==========================================
+app.post('/api/call-cancel', async (req, res) => {
+  try {
+    if (!db) return res.status(500).json({ error: 'DB not available' });
+    const { matchId, senderId } = req.body;
+    if (!matchId || !senderId) return res.status(400).json({ error: 'matchId and senderId required' });
+
+    let userIds = [];
+    if (matchId.startsWith('dm_')) {
+      const parts = matchId.replace('dm_', '').split('_');
+      userIds = parts.filter(id => id !== senderId);
+    } else if (matchId.startsWith('group_')) {
+      const groupId = matchId.replace('group_', '');
+      const groupData = await getCachedDoc('Groups', groupId);
+      if (groupData?.members?.length) {
+        userIds = groupData.members.filter(id => id !== senderId);
+      }
+    } else {
+      const matchDoc = await getCachedDoc('Matches', matchId);
+      if (matchDoc?.players) {
+        userIds = matchDoc.players.filter(id => id !== senderId);
+      }
+    }
+
+    if (userIds.length === 0) return res.json({ success: true, sent: 0, msg: 'No users to notify' });
+
+    const tokens = await getUsersTokens(userIds);
+    if (tokens.length === 0) return res.json({ success: true, sent: 0, msg: 'No online users' });
+
+    console.log(`🔇 Sending call_cancel to ${tokens.length} devices for match ${matchId}`);
+
+    const response = await admin.messaging().sendEachForMulticast({
+      data: {
+        type: 'call_cancel',
+        matchId: matchId,
+        timestamp: Date.now().toString()
+      },
+      android: {
+        priority: 'high',
+        ttl: 0,
+      },
+      apns: {
+         headers: { 'apns-priority': '10' },
+         payload: { aps: { contentAvailable: true } }
+      },
+      tokens
+    });
+
+    res.json({ success: true, sent: response.successCount });
+  } catch (err) {
+    console.error('[Call Cancel Error]', err.message);
     res.status(500).json({ error: err.message });
   }
 });
