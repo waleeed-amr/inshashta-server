@@ -1,6 +1,6 @@
 {
   "name": "inshashta-server",
-  "version": "6.1.0",
+  "version": "5.0.0",
   "description": "in shashta notification server",
   "main": "index.js",
   "scripts": {

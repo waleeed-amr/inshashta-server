@@ -9,6 +9,49 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+// ==========================================
+// 🛡️ SECURITY HEADERS (HELMET-LITE)
+// ==========================================
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  next();
+});
+
+// ==========================================
+// 🚦 ADVANCED RATE LIMITER (MEMORY-BASED)
+// ==========================================
+const rateLimitMap = new Map();
+const RATE_LIMIT_WINDOW = 60000; // 1 minute
+const MAX_REQUESTS = 150; // max requests per minute
+
+app.use('/api', (req, res, next) => {
+  // Allow health/warm requests unconditionally
+  if (req.path === '/warm' || req.path === '/health' || req.method === 'GET') return next();
+  
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  const now = Date.now();
+  
+  if (!rateLimitMap.has(ip)) {
+    rateLimitMap.set(ip, { count: 1, startTime: now });
+  } else {
+    const data = rateLimitMap.get(ip);
+    if (now - data.startTime > RATE_LIMIT_WINDOW) {
+      // Reset window
+      data.count = 1;
+      data.startTime = now;
+    } else {
+      data.count++;
+      if (data.count > MAX_REQUESTS) {
+        return res.status(429).json({ error: 'Too many requests, slow down.' });
+      }
+    }
+  }
+  next();
+});
+
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
@@ -243,8 +286,8 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
 // ==========================================
 
 // Health check + warm-up endpoint (prevents Vercel cold start)
-app.get('/', (req, res) => res.json({ status: 'Server is running', version: '6.1.1', ts: Date.now() }));
-app.get('/api', (req, res) => res.json({ status: 'Server is running', version: '6.1.1', ts: Date.now() }));
+app.get('/', (req, res) => res.json({ status: 'Server is running', version: '5.0.0', ts: Date.now() }));
+app.get('/api', (req, res) => res.json({ status: 'Server is running', version: '5.0.0', ts: Date.now() }));
 
 // Dedicated warm-up endpoint (called on app launch to prevent cold start delay)
 app.get('/api/warm', (req, res) => {
@@ -469,151 +512,86 @@ app.post('/api/broadcast', async (req, res) => {
 });
 
 // ==========================================
-// 4. Call Invite - Ring the user's phone via Notification Push
+// ADMIN DASHBOARD: Server Stats
 // ==========================================
-app.post('/api/call-invite', async (req, res) => {
+app.get('/api/stats', (req, res) => {
+  const adminKey = req.headers['x-admin-key'];
+  if (adminKey !== (process.env.ADMIN_KEY || 'inshashta2026')) {
+    return res.status(403).json({ error: 'منطقة محظورة 🚫 - مسار محمي بكلمة مرور' });
+  }
+  
+  res.json({
+    status: 'Running efficiently',
+    version: '5.0.0',
+    uptime: process.uptime(),
+    activeCacheEntries: CacheStore.size,
+    rateLimiterActiveIPs: rateLimitMap.size,
+    memoryUsage: process.memoryUsage(),
+    firebaseInitialized: !!admin.apps.length
+  });
+});
+
+// ==========================================
+// 4. Delete Message Notification (Overwrite Tray)
+// ==========================================
+app.post('/api/delete-notification', async (req, res) => {
   try {
     if (!db) return res.status(500).json({ error: 'DB not available' });
-    const { matchId, callerId, type } = req.body;
-    if (!matchId || !callerId) return res.status(400).json({ error: 'matchId and callerId required' });
-
-    console.log(`\n📞 Call invite: matchId=${matchId}, callerId=${callerId}`);
-
-    const callerData = await getCachedUser(callerId);
-    const callerName = callerData ? callerData.name : 'User';
-    const callerAvatar = callerData ? (callerData.avatarUrl || '') : '';
+    const { matchId } = req.body;
+    if (!matchId) return res.status(400).json({ error: 'matchId required' });
+    
+    console.log(`\n🗑️ Delete notification requested for: matchId=${matchId}`);
 
     const isDM = matchId.startsWith('dm_');
     const isGroup = matchId.startsWith('group_');
     const tokens = [];
-    const userIds = [];
     
-    // Fetch target user(s) tokens via Bulk Cache
+    // Fetch tokens
     if (isDM) {
       const parts = matchId.replace('dm_', '').split('_');
-      const otherUid = parts.find(p => p !== callerId);
-      if (otherUid) {
-        const otherData = await getCachedUser(otherUid);
-        if (otherData && otherData.fcmToken) {
-          tokens.push(otherData.fcmToken);
-          userIds.push(otherUid);
-        }
+      for (const uid of parts) {
+        const data = await getCachedUser(uid);
+        if (data?.fcmToken) tokens.push(data.fcmToken);
       }
     } else if (isGroup) {
       const groupData = await getCachedDoc('Groups', matchId.replace('group_', ''));
-      if (groupData) {
-        const memberIds = (groupData.members || []).filter(id => id !== callerId);
-        if (memberIds.length > 0) {
-          const usersData = await getCachedUsersBatch(memberIds);
-          Object.keys(usersData).forEach(uid => {
-            if (usersData[uid].fcmToken) { tokens.push(usersData[uid].fcmToken); userIds.push(uid); }
-          });
-        }
+      if (groupData?.members?.length > 0) {
+        const usersData = await getCachedUsersBatch(groupData.members);
+        Object.keys(usersData).forEach(uid => {
+           if (usersData[uid].fcmToken) tokens.push(usersData[uid].fcmToken);
+        });
       }
     } else {
       const matchData = await getCachedDoc('Matches', matchId);
-      if (matchData) {
-        const pIds = (matchData.players || []).filter(id => id !== callerId);
-        if (pIds.length > 0) {
-          const usersData = await getCachedUsersBatch(pIds);
-          Object.keys(usersData).forEach(uid => {
-            if (usersData[uid].fcmToken) { tokens.push(usersData[uid].fcmToken); userIds.push(uid); }
-          });
-        }
+      if (matchData?.players?.length > 0) {
+        const usersData = await getCachedUsersBatch(matchData.players);
+        Object.keys(usersData).forEach(uid => {
+           if (usersData[uid].fcmToken) tokens.push(usersData[uid].fcmToken);
+        });
       }
     }
 
     if (tokens.length === 0) return res.json({ success: true, sent: 0, reason: 'No tokens found' });
 
-    const title = `📞 مكالمة واردة من ${callerName}`;
-    const body = `اضغط للرد على المكالمة والانضمام`;
-
-    // CRITICAL: Send DATA-ONLY FCM (no "notification" key!)
-    // If "notification" key is present, Android handles it via system tray
-    // and onMessageReceived is NEVER called when app is killed/background.
-    // With data-only, onMessageReceived is ALWAYS called → IncomingCallActivity launches.
+    // Send a message that overwrites the notification tag with "Message deleted"
     const response = await admin.messaging().sendEachForMulticast({
       data: {
-        title,
-        body,
+        title: 'تنبيه',
+        body: '🚫 تم حذف هذه الرسالة',
+        type: 'delete_message',
         matchId,
-        type: 'call_invite',
-        callType: type || 'video_call',
-        senderName: callerName,
-        senderAvatar: callerAvatar,
         timestamp: Date.now().toString()
       },
       android: {
         priority: 'high',
         ttl: 0,
       },
-      apns: {
-         headers: { 'apns-priority': '10' },
-         payload: { aps: { contentAvailable: true, sound: 'default', category: 'CALL_INVITE' } }
-      },
       tokens
     });
 
     res.json({ success: true, sent: response.successCount });
   } catch (err) {
-    console.error('[Call Invite Error]', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ==========================================
-// 4b. Send Call Cancel (Silent Notification)
-// ==========================================
-app.post('/api/call-cancel', async (req, res) => {
-  try {
-    if (!db) return res.status(500).json({ error: 'DB not available' });
-    const { matchId, senderId } = req.body;
-    if (!matchId || !senderId) return res.status(400).json({ error: 'matchId and senderId required' });
-
-    let userIds = [];
-    if (matchId.startsWith('dm_')) {
-      const parts = matchId.replace('dm_', '').split('_');
-      userIds = parts.filter(id => id !== senderId);
-    } else if (matchId.startsWith('group_')) {
-      const groupId = matchId.replace('group_', '');
-      const groupData = await getCachedDoc('Groups', groupId);
-      if (groupData?.members?.length) {
-        userIds = groupData.members.filter(id => id !== senderId);
-      }
-    } else {
-      const matchDoc = await getCachedDoc('Matches', matchId);
-      if (matchDoc?.players) {
-        userIds = matchDoc.players.filter(id => id !== senderId);
-      }
-    }
-
-    if (userIds.length === 0) return res.json({ success: true, sent: 0, msg: 'No users to notify' });
-
-    const tokens = await getUsersTokens(userIds);
-    if (tokens.length === 0) return res.json({ success: true, sent: 0, msg: 'No online users' });
-
-    console.log(`🔇 Sending call_cancel to ${tokens.length} devices for match ${matchId}`);
-
-    const response = await admin.messaging().sendEachForMulticast({
-      data: {
-        type: 'call_cancel',
-        matchId: matchId,
-        timestamp: Date.now().toString()
-      },
-      android: {
-        priority: 'high',
-        ttl: 0,
-      },
-      apns: {
-         headers: { 'apns-priority': '10' },
-         payload: { aps: { contentAvailable: true } }
-      },
-      tokens
-    });
-
-    res.json({ success: true, sent: response.successCount });
-  } catch (err) {
-    console.error('[Call Cancel Error]', err.message);
+    console.error('[Delete Notification Error]', err.message);
     res.status(500).json({ error: err.message });
   }
 });
