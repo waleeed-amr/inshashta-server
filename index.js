@@ -510,6 +510,95 @@ app.post('/api/broadcast', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+// ==========================================
+// 3b. Reply Message - Inline reply from notification
+// ==========================================
+app.post('/api/reply-message', async (req, res) => {
+  try {
+    if (!db) return res.status(500).json({ error: 'DB not available' });
+    const { matchId, senderId, text } = req.body;
+    if (!matchId || !senderId || !text) {
+      return res.status(400).json({ error: 'matchId, senderId and text required' });
+    }
+
+    console.log(`\n💬 Inline reply: matchId=${matchId}, senderId=${senderId}, text=${text}`);
+
+    // 1. Save the message to Firestore
+    await db.collection('Messages').add({
+      matchId,
+      senderId,
+      text,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      readBy: [senderId]
+    });
+
+    // 2. Get sender info for notification
+    const senderData = await getCachedUser(senderId);
+    const senderName = senderData ? senderData.name : 'User';
+    const senderAvatar = senderData ? (senderData.avatarUrl || '') : '';
+
+    // 3. Collect recipient tokens
+    const isDM = matchId.startsWith('dm_');
+    const isGroup = matchId.startsWith('group_');
+    const tokens = [];
+    const userIds = [];
+    let chatName = '';
+
+    if (isDM) {
+      const parts = matchId.replace('dm_', '').split('_');
+      const otherUid = parts.find(p => p !== senderId);
+      if (otherUid) {
+        const otherData = await getCachedUser(otherUid);
+        if (otherData && otherData.fcmToken) {
+          tokens.push(otherData.fcmToken);
+          userIds.push(otherUid);
+        }
+      }
+      chatName = senderName;
+    } else if (isGroup) {
+      const groupId = matchId.replace('group_', '');
+      const groupData = await getCachedDoc('Groups', groupId);
+      chatName = groupData?.name || 'Group';
+      const memberIds = (groupData?.members || []).filter(id => id !== senderId);
+      if (memberIds.length > 0) {
+        const usersData = await getCachedUsersBatch(memberIds);
+        Object.keys(usersData).forEach(uid => {
+          if (usersData[uid].fcmToken) { tokens.push(usersData[uid].fcmToken); userIds.push(uid); }
+        });
+      }
+    } else {
+      const matchData = await getCachedDoc('Matches', matchId);
+      chatName = matchData?.name || 'Match';
+      const pIds = (matchData?.players || []).filter(id => id !== senderId);
+      if (pIds.length > 0) {
+        const usersData = await getCachedUsersBatch(pIds);
+        Object.keys(usersData).forEach(uid => {
+          if (usersData[uid].fcmToken) { tokens.push(usersData[uid].fcmToken); userIds.push(uid); }
+        });
+      }
+    }
+
+    // 4. Send FCM notification to recipients
+    const title = isDM ? senderName : chatName;
+    const body = isDM ? text : `${senderName}: ${text}`;
+    const msgType = isDM ? 'dm_message' : (isGroup ? 'group_message' : 'chat_message');
+
+    if (tokens.length > 0) {
+      const result = await sendFCMAndSave({
+        tokens, userIds, title, body,
+        data: { matchId, type: msgType, chatName },
+        type: msgType, targetId: matchId,
+        senderName, senderAvatar
+      });
+      console.log(`📲 Reply notification sent: ${result.sent} devices`);
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[Reply Message Error]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ==========================================
 // ADMIN DASHBOARD: Server Stats
