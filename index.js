@@ -190,10 +190,9 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
   // ========== STEP 1: Send FCM IMMEDIATELY (highest priority) ==========
   try {
     const payload = {
-      notification: {
-        title: title || '',
-        body: body || ''
-      },
+      // V8: DATA-ONLY payload (no 'notification' block!)
+      // This ensures onMessageReceived ALWAYS fires (foreground + background)
+      // which means our custom notification with reply action is ALWAYS shown
       data: {
         ...(data || {}),
         title: title || '',
@@ -206,10 +205,7 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
       },
       android: {
         priority: 'high',
-        ttl: 0,
-        notification: {
-          sound: 'default'
-        }
+        ttl: 0
       },
       apns: {
         headers: { 'apns-priority': '10' },
@@ -286,8 +282,8 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
 // ==========================================
 
 // Health check + warm-up endpoint (prevents Vercel cold start)
-app.get('/', (req, res) => res.json({ status: 'Server is running', version: '5.0.0', ts: Date.now() }));
-app.get('/api', (req, res) => res.json({ status: 'Server is running', version: '5.0.0', ts: Date.now() }));
+app.get('/', (req, res) => res.json({ status: 'Server is running', version: '8.0.0', ts: Date.now() }));
+app.get('/api', (req, res) => res.json({ status: 'Server is running', version: '8.0.0', ts: Date.now() }));
 
 // Dedicated warm-up endpoint (called on app launch to prevent cold start delay)
 app.get('/api/warm', (req, res) => {
@@ -611,7 +607,7 @@ app.get('/api/stats', (req, res) => {
   
   res.json({
     status: 'Running efficiently',
-    version: '5.0.0',
+    version: '8.0.0',
     uptime: process.uptime(),
     activeCacheEntries: CacheStore.size,
     rateLimiterActiveIPs: rateLimitMap.size,
