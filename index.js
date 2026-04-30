@@ -503,26 +503,33 @@ app.post('/api/broadcast', async (req, res) => {
     // Send FCM data-only
     let sent = 0;
     try {
-      const response = await admin.messaging().sendEachForMulticast({
-        data: {
-          title,
-          body: message,
-          type: 'global_broadcast',
-          senderName: 'Admin',
-          senderAvatar: '',
-          timestamp: Date.now().toString()
-        },
-        android: {
-          priority: 'high',
-          ttl: 0,
-        },
-        apns: {
-          headers: { 'apns-priority': '10' },
-          payload: { aps: { contentAvailable: true, sound: 'default', alert: { title, body: message } } }
-        },
-        tokens
-      });
-      sent = response.successCount;
+      // Chunk tokens in batches of 500 (Firebase limit)
+      const chunkSize = 500;
+      for (let i = 0; i < tokens.length; i += chunkSize) {
+        const tokenChunk = tokens.slice(i, i + chunkSize);
+        
+        const response = await admin.messaging().sendEachForMulticast({
+          data: {
+            title,
+            body: message,
+            type: 'global_broadcast',
+            senderName: 'Admin',
+            senderAvatar: '',
+            timestamp: Date.now().toString()
+          },
+          android: {
+            priority: 'high',
+            ttl: 0,
+          },
+          apns: {
+            headers: { 'apns-priority': '10' },
+            payload: { aps: { contentAvailable: true, sound: 'default', alert: { title, body: message } } }
+          },
+          tokens: tokenChunk
+        });
+        
+        sent += response.successCount;
+      }
       console.log(`📲 Broadcast FCM: ${sent}/${tokens.length}`);
     } catch (err) {
       console.error('❌ Broadcast FCM error:', err.message);
