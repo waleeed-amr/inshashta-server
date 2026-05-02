@@ -567,6 +567,47 @@ app.post('/api/broadcast', async (req, res) => {
   }
 });
 // ==========================================
+// 3b. Notify Status Reaction
+// ==========================================
+app.post('/api/notify-status-reaction', async (req, res) => {
+  try {
+    if (!db) return res.status(500).json({ error: 'DB not available' });
+    const { targetUserId, senderId, emoji } = req.body;
+    if (!targetUserId || !senderId || !emoji) {
+      return res.status(400).json({ error: 'targetUserId, senderId and emoji required' });
+    }
+
+    console.log(`\n💖 Notify Status Reaction: target=${targetUserId}, sender=${senderId}, emoji=${emoji}`);
+
+    const senderData = await getCachedUser(senderId);
+    const senderName = senderData ? senderData.name : 'مستخدم';
+    
+    const targetData = await getCachedUser(targetUserId);
+    if (!targetData || !targetData.fcmToken) return res.json({ success: true, sent: 0, reason: 'No token' });
+
+    const title = 'تفاعل جديد على حالتك';
+    const body = `لقد تفاعل ${senderName} مع حالتك بـ ${emoji}`;
+
+    const result = await sendFCMAndSave({
+      tokens: [targetData.fcmToken],
+      userIds: [targetUserId],
+      title,
+      body,
+      data: { type: 'status_reaction' },
+      type: 'status_reaction',
+      targetId: senderId,
+      senderName,
+      senderAvatar: senderData?.avatarUrl || ''
+    });
+
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[Notify Status Reaction Error]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==========================================
 // 3b. Reply Message - Inline reply from notification
 // ==========================================
 app.post('/api/reply-message', async (req, res) => {
