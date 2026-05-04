@@ -315,8 +315,8 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
 // ==========================================
 
 // Health check + warm-up endpoint (prevents Vercel cold start)
-app.get('/', (req, res) => res.json({ status: 'Server is running', version: '9.2.0', ts: Date.now() }));
-app.get('/api', (req, res) => res.json({ status: 'Server is running', version: '9.2.0', ts: Date.now() }));
+app.get('/', (req, res) => res.json({ status: 'Server is running', version: '9.5.0', ts: Date.now() }));
+app.get('/api', (req, res) => res.json({ status: 'Server is running', version: '9.5.0', ts: Date.now() }));
 
 // Dedicated warm-up endpoint (called on app launch to prevent cold start delay)
 app.get('/api/warm', (req, res) => {
@@ -333,7 +333,9 @@ app.get('/api/cloudinary-sign', (req, res) => {
     const apiKey = "566119222639312";
     const cloudName = "dd07kmewo";
     
-    const signature = crypto.createHash('sha1').update(`timestamp=${timestamp}${apiSecret}`).digest('hex');
+    // Cloudinary signature requires params to be alphabetically sorted
+    // timestamp before transformation (t-i before t-r)
+    const signature = crypto.createHash('sha1').update(`timestamp=${timestamp}&transformation=w_256,h_256,c_fit,f_png${apiSecret}`).digest('hex');
     
     res.json({
       signature,
@@ -728,7 +730,7 @@ app.get('/api/stats', (req, res) => {
   
   res.json({
     status: 'Running efficiently',
-    version: '9.2.0',
+    version: '9.5.0',
     uptime: process.uptime(),
     activeCacheEntries: CacheStore.size,
     rateLimiterActiveIPs: rateLimitMap.size,
@@ -999,6 +1001,279 @@ app.get('/api/health', async (req, res) => {
 
   res.json(health);
 });
+
+// ==========================================
+// 12. Admin: Reset User Password (FREE)
+// ==========================================
+app.post('/api/admin/reset-password', asyncHandler(async (req, res) => {
+  // Verify admin key
+  const adminKey = req.headers['x-admin-key'];
+  if (adminKey !== (process.env.ADMIN_KEY || 'inshashta2026')) {
+    return res.status(403).json({ error: 'Unauthorized - Admin access required' });
+  }
+
+  const { phone, newPassword } = req.body;
+  if (!phone || !newPassword) {
+    return res.status(400).json({ error: 'phone and newPassword are required' });
+  }
+  if (newPassword.length < 6) {
+    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  }
+
+  const cleanPhone = phone.trim().replace(/[\s-]/g, '');
+  const fakeEmail = `${cleanPhone}@inshashta.app`;
+
+  console.log(`\n🔑 Admin password reset for: ${fakeEmail}`);
+
+  try {
+    // 1. Find user by email (fake email from phone)
+    const userRecord = await admin.auth().getUserByEmail(fakeEmail);
+    
+    // 2. Update password
+    await admin.auth().updateUser(userRecord.uid, { password: newPassword });
+
+    console.log(`✅ Password reset successful for UID: ${userRecord.uid}`);
+    res.json({ 
+      success: true, 
+      message: `Password reset for ${cleanPhone}`,
+      uid: userRecord.uid
+    });
+  } catch (err) {
+    if (err.code === 'auth/user-not-found') {
+      return res.status(404).json({ error: `User not found with phone: ${cleanPhone}` });
+    }
+    console.error('❌ Password reset failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+}));
+
+// ==========================================
+// 12b. Self-Service: Device-Verified Password Reset (AI-Supervised)
+// ==========================================
+app.post('/api/recover-account', asyncHandler(async (req, res) => {
+  if (!db) return res.status(500).json({ error: 'DB not available' });
+
+  const { phone, deviceId, newPassword } = req.body;
+  if (!phone || !deviceId || !newPassword) {
+    return res.status(400).json({ error: 'phone, deviceId and newPassword are required' });
+  }
+  if (newPassword.length < 6) {
+    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  }
+
+  const cleanPhone = phone.trim().replace(/[\s-]/g, '');
+  const fakeEmail = `${cleanPhone}@inshashta.app`;
+
+  console.log(`\n🔐 Self-service recovery for: ${cleanPhone}, deviceId: ${deviceId.slice(0, 10)}...`);
+
+  try {
+    // 1. Find user in Firebase Auth
+    const userRecord = await admin.auth().getUserByEmail(fakeEmail);
+
+    // 2. Look up user in Firestore to check device
+    const userDoc = await db.collection('Users').doc(userRecord.uid).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'user_not_found', message: 'لا يوجد حساب مرتبط بهذا الرقم' });
+    }
+
+    const userData = userDoc.data();
+
+    // 3. Compare deviceId
+    if (!userData.deviceId) {
+      return res.status(403).json({ 
+        error: 'no_device_registered',
+        message: 'لم يتم تسجيل جهاز لهذا الحساب. تواصل مع الأدمن لاستعادة الحساب.'
+      });
+    }
+
+    if (userData.deviceId !== deviceId) {
+      console.log(`❌ Device mismatch! Stored: ${userData.deviceId?.slice(0, 10)}, Provided: ${deviceId.slice(0, 10)}`);
+      return res.status(403).json({ 
+        error: 'device_mismatch',
+        message: 'هذا الجهاز لا يتطابق مع الجهاز المسجل في الحساب. تواصل مع الأدمن.'
+      });
+    }
+
+    // 4. Device matches! Reset password
+    await admin.auth().updateUser(userRecord.uid, { password: newPassword });
+
+    console.log(`✅ Self-service recovery successful for UID: ${userRecord.uid}`);
+    res.json({ 
+      success: true, 
+      message: 'تم إعادة تعيين كلمة المرور بنجاح!',
+      userName: userData.name || ''
+    });
+  } catch (err) {
+    if (err.code === 'auth/user-not-found') {
+      return res.status(404).json({ error: 'user_not_found', message: 'لا يوجد حساب مرتبط بهذا الرقم' });
+    }
+    console.error('❌ Self-service recovery failed:', err.message);
+    res.status(500).json({ error: 'server_error', message: 'حدث خطأ، حاول مرة أخرى لاحقاً' });
+  }
+}));
+
+// ==========================================
+// 13. Gemini AI Chat Proxy
+// ==========================================
+const aiRateLimitMap = new Map();
+const AI_RATE_LIMIT_WINDOW = 60000; // 1 minute
+const AI_MAX_REQUESTS = 30; // 30 AI requests per minute per user
+
+app.post('/api/ai/chat', asyncHandler(async (req, res) => {
+  const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'AIzaSyDDQMlVeTWqWZp92X06bFH_E0jq_0QvqN0';
+  if (!GEMINI_API_KEY) {
+    return res.status(500).json({ error: 'Gemini API key not configured' });
+  }
+
+  const { message, history, userId } = req.body;
+  if (!message) {
+    return res.status(400).json({ error: 'message is required' });
+  }
+
+  // Per-user rate limiting for AI
+  const rateLimitKey = userId || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  const now = Date.now();
+  if (aiRateLimitMap.has(rateLimitKey)) {
+    const data = aiRateLimitMap.get(rateLimitKey);
+    if (now - data.startTime > AI_RATE_LIMIT_WINDOW) {
+      data.count = 1;
+      data.startTime = now;
+    } else {
+      data.count++;
+      if (data.count > AI_MAX_REQUESTS) {
+        return res.status(429).json({ error: 'لقد تجاوزت الحد المسموح. حاول مرة أخرى بعد دقيقة.' });
+      }
+    }
+  } else {
+    aiRateLimitMap.set(rateLimitKey, { count: 1, startTime: now });
+  }
+
+  console.log(`\n🤖 AI Chat request from: ${rateLimitKey}`);
+
+  try {
+    // Build conversation history for Gemini
+    const contents = [];
+
+    const systemPrompt = `أنت "شِشتا AI" ✅ - المساعد الرسمي المعتمد لتطبيق "in shashta". أنت مشرف ذكي وموثق على التطبيق بالكامل.
+
+🏷️ هويتك:
+- اسمك: شِشتا AI
+- أنت حساب موثق ✅ ومعتمد رسمياً من التطبيق
+- أنت المشرف الذكي الرسمي على تطبيق in shashta
+- مالك التطبيق بالكامل هو: وليد عمرو خيال
+- لا تذكر أبداً أنك Gemini أو Google أو أي نموذج ذكاء اصطناعي آخر
+
+📱 عن التطبيق:
+in shashta هو تطبيق دردشة وسوشيال ميديا بين الأصدقاء. التطبيق مصمم للتواصل الاجتماعي والمرح بين الأصحاب.
+
+💬 ميزات التطبيق التي تشرف عليها:
+1. **المحادثات** - دردشة فردية وجماعية مع صور وفيديوهات ورسائل صوتية وملصقات (الميزة الأساسية)
+2. **المجموعات** - مجموعات أصدقاء وشِلل
+3. **الحالة** - مشاركة حالات (صور/فيديو/نصوص) تختفي بعد 24 ساعة (زي الستوري)
+4. **الملف الشخصي** - إعدادات الحساب، صورة البروفايل، تغيير الاسم
+5. **الإشعارات** - تنبيهات الرسائل والأنشطة الجديدة
+6. **الملصقات** - ملصقات متحركة وإيموجي في المحادثات
+7. **الرسائل الصوتية** - تسجيل وإرسال رسائل صوتية
+8. **إعادة التوجيه** - تحويل الرسائل بين المحادثات
+9. **التفاعلات** - ردود فعل بالإيموجي على الرسائل
+10. **المباريات** - ميزة إضافية لتنظيم مباريات كرة قدم بين الأصحاب
+
+🛡️ صلاحياتك كمشرف:
+- مساعدة المستخدمين في حل أي مشكلة
+- شرح كيفية استخدام أي ميزة في التطبيق
+- الإجابة عن أي سؤال عام
+- تقديم اقتراحات لتحسين تجربة المستخدم
+- الدردشة العامة بأسلوب ودي ومرح
+
+🎯 قواعد الرد:
+- رد بالعربي المصري العامي بشكل طبيعي
+- لو المستخدم كتب بلغة تانية، رد بنفس لغته
+- استخدم إيموجي بشكل طبيعي ومناسب
+- كن مختصر ومفيد - ما تطولش في الكلام
+- كن ودود ومرح زي صاحب بيساعد
+- لو سألوك "مين أنت" قول أنك شِشتا AI المشرف المعتمد ✅ على التطبيق
+- لو سألوك "مين صاحب التطبيق" قول وليد عمرو خيال
+- لو سألوك عن أي موضوع عام، رد عادي بشكل مختصر
+- لا تخترع معلومات عن مستخدمين محددين
+- لو حد طلب مساعدة تقنية، وجهه بالخطوات بالتفصيل`;
+
+
+    // Add conversation history
+    if (history && Array.isArray(history) && history.length > 0) {
+      // First message must be from 'user'
+      const firstUserIdx = history.findIndex(h => h.role === 'user');
+      const validHistory = firstUserIdx >= 0 ? history.slice(firstUserIdx) : [];
+      
+      validHistory.forEach(h => {
+        contents.push({
+          role: h.role === 'assistant' ? 'model' : 'user',
+          parts: [{ text: h.content }]
+        });
+      });
+    }
+
+    // Add current message
+    contents.push({
+      role: 'user',
+      parts: [{ text: message }]
+    });
+
+    // Call Gemini API
+    const geminiResponse = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        contents,
+        systemInstruction: {
+          parts: [{ text: systemPrompt }]
+        },
+        generationConfig: {
+          temperature: 0.8,
+          topK: 40,
+          topP: 0.95,
+          maxOutputTokens: 2048
+        },
+        safetySettings: [
+          { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_ONLY_HIGH' },
+          { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_ONLY_HIGH' },
+          { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_ONLY_HIGH' },
+          { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_ONLY_HIGH' }
+        ]
+      },
+      {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 30000
+      }
+    );
+
+    const aiText = geminiResponse.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    
+    if (!aiText) {
+      console.error('❌ Empty AI response:', JSON.stringify(geminiResponse.data));
+      return res.status(500).json({ error: 'لم أتمكن من الرد. حاول مرة أخرى.' });
+    }
+
+    console.log(`✅ AI responded: ${aiText.substring(0, 80)}...`);
+    res.json({ success: true, reply: aiText });
+
+  } catch (err) {
+    console.error('❌ Gemini API error:', err.response?.data || err.message);
+    const status = err.response?.status || 500;
+    const errorMsg = status === 429 
+      ? 'الـ AI مشغول حالياً، حاول مرة أخرى بعد شوية.'
+      : 'حدث خطأ في الاتصال بالذكاء الاصطناعي.';
+    res.status(status).json({ error: errorMsg });
+  }
+}));
+
+// Clean up AI rate limit map every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, data] of aiRateLimitMap.entries()) {
+    if (now - data.startTime > AI_RATE_LIMIT_WINDOW) {
+      aiRateLimitMap.delete(key);
+    }
+  }
+}, 5 * 60 * 1000);
 
 // ==========================================
 // 🛑 GLOBAL ERROR HANDLER
