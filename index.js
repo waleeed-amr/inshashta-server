@@ -111,6 +111,16 @@ const db = admin.apps.length ? admin.firestore() : null;
 const CacheStore = new Map();
 const CACHE_TTL = 15000;
 
+// Garbage collection to clean up expired cache items and prevent memory leaks
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, value] of CacheStore.entries()) {
+    if (now - value.time > CACHE_TTL) {
+      CacheStore.delete(key);
+    }
+  }
+}, 60000); // Run every 60 seconds
+
 async function getCachedUser(uid) {
   if (!uid) return null;
   const key = `User_${uid}`;
@@ -234,7 +244,8 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
         senderAvatar: senderAvatar || '',
         type: type || 'general',
         targetId: targetId || '',
-        timestamp: Date.now().toString()
+        timestamp: Date.now().toString(),
+        channelId: 'in_shashta_messages_v2' // Ensures right channel mapping if needed by client
       },
       android: {
         priority: 'high',
@@ -1140,9 +1151,10 @@ app.post('/api/ai/chat', asyncHandler(async (req, res) => {
       data.startTime = now;
     } else {
       data.count++;
-      if (data.count > AI_MAX_REQUESTS) {
-        return res.status(429).json({ error: 'لقد تجاوزت الحد المسموح. حاول مرة أخرى بعد دقيقة.' });
-      }
+      // Limit removed for admin usage 
+      // if (data.count > AI_MAX_REQUESTS) {
+      //   return res.status(429).json({ error: 'لقد تجاوزت الحد المسموح. حاول مرة أخرى بعد دقيقة.' });
+      // }
     }
   } else {
     aiRateLimitMap.set(rateLimitKey, { count: 1, startTime: now });
@@ -1274,6 +1286,34 @@ setInterval(() => {
     }
   }
 }, 5 * 60 * 1000);
+
+// ==========================================
+// 🔔 SECURITY: NEW LOGIN NOTIFICATION
+// ==========================================
+app.post('/api/notify-new-login', async (req, res) => {
+  const { uid, deviceName } = req.body;
+  if (!uid || !deviceName) return res.status(400).json({ error: 'Missing data' });
+  try {
+    const userDoc = await admin.firestore().collection('Users').doc(uid).get();
+    if (!userDoc.exists) return res.status(404).json({ error: 'User not found' });
+    const userData = userDoc.data();
+    if (userData.fcmToken) {
+      await sendFCMAndSave({
+        tokens: [userData.fcmToken],
+        userIds: [uid],
+        title: '🚨 تنبيه أمني خطير',
+        body: `تم تسجيل الدخول للتو إلى حسابك من جهاز جديد: ${deviceName}. إذا لم تكن أنت، قم بتغيير كلمة المرور فوراً.`,
+        type: 'security_alert',
+        targetId: 'security'
+      });
+      return res.json({ success: true });
+    }
+    res.json({ success: false, message: 'No previous token found' });
+  } catch (err) {
+    console.error('Notify new login error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ==========================================
 // 🛑 GLOBAL ERROR HANDLER
