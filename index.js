@@ -605,6 +605,58 @@ app.post('/api/broadcast', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ==========================================
+// 3a-2. Notify Admin of Badge Request
+// ==========================================
+app.post('/api/notify-badge-request', async (req, res) => {
+  try {
+    if (!db) return res.status(500).json({ error: 'DB not available' });
+    const { userName, userId } = req.body;
+    if (!userName) return res.status(400).json({ error: 'userName required' });
+
+    console.log(`\n🏅 Badge Request Notification: from ${userName} (${userId})`);
+
+    // Find admin user by email
+    const adminSnap = await db.collection('Users')
+      .where('email', '==', '01022763613@inshashta.app')
+      .limit(1)
+      .get();
+
+    if (adminSnap.empty) {
+      return res.json({ success: true, sent: 0, reason: 'Admin not found' });
+    }
+
+    const adminDoc = adminSnap.docs[0];
+    const adminData = adminDoc.data();
+    const adminId = adminDoc.id;
+
+    if (!adminData.fcmToken) {
+      return res.json({ success: true, sent: 0, reason: 'Admin has no token' });
+    }
+
+    const title = '🏅 طلب توثيق جديد';
+    const body = `يوجد طلب توثيق حساب جديد من ${userName}`;
+
+    const result = await sendFCMAndSave({
+      tokens: [adminData.fcmToken],
+      userIds: [adminId],
+      title,
+      body,
+      data: { type: 'badge_request' },
+      type: 'badge_request',
+      targetId: userId || '',
+      senderName: userName,
+      senderAvatar: ''
+    });
+
+    res.json({ success: true, sent: result.sent });
+  } catch (err) {
+    console.error('[Badge Request Notify Error]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ==========================================
 // 3b. Notify Status Reaction
 // ==========================================
