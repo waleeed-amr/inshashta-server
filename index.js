@@ -530,6 +530,12 @@ app.post('/api/notify-join', async (req, res) => {
 // ==========================================
 app.post('/api/broadcast', async (req, res) => {
   try {
+    // Verify admin key
+    const adminKey = req.headers['x-admin-key'];
+    if (adminKey !== (process.env.ADMIN_KEY || 'inshashta2026')) {
+      return res.status(403).json({ error: 'Unauthorized - Admin access required' });
+    }
+
     if (!db) return res.status(500).json({ error: 'DB not available' });
     const { title, message } = req.body;
     if (!title || !message) return res.status(400).json({ error: 'title and message required' });
