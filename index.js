@@ -288,37 +288,40 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
     console.error('❌ FCM send error:', err.message);
   }
 
-  // ========== STEP 2: Save to Firestore via Batched Writes (High Speed) ==========
-  let saved = 0;
+  // ========== STEP 2: Save to Firestore in BACKGROUND (High Speed & Non-blocking) ==========
   if (db && uniqueUserIds && uniqueUserIds.length > 0) {
-    try {
-      for (let i = 0; i < uniqueUserIds.length; i += 400) {
-        const batchIds = uniqueUserIds.slice(i, i + 400);
-        const batch = db.batch();
-        batchIds.forEach(uid => {
-          const docRef = db.collection('Notifications').doc();
-          batch.set(docRef, {
-            userId: uid,
-            title,
-            body,
-            type: type || 'general',
-            targetId: targetId || '',
-            senderName: senderName || '',
-            senderAvatar: senderAvatar || '',
-            read: false,
-            createdAt: admin.firestore.FieldValue.serverTimestamp()
+    (async () => {
+      try {
+        let savedBg = 0;
+        for (let i = 0; i < uniqueUserIds.length; i += 400) {
+          const batchIds = uniqueUserIds.slice(i, i + 400);
+          const batch = db.batch();
+          batchIds.forEach(uid => {
+            const docRef = db.collection('Notifications').doc();
+            batch.set(docRef, {
+              userId: uid,
+              title,
+              body,
+              type: type || 'general',
+              targetId: targetId || '',
+              senderName: senderName || '',
+              senderAvatar: senderAvatar || '',
+              read: false,
+              createdAt: admin.firestore.FieldValue.serverTimestamp()
+            });
           });
-        });
-        await batch.commit();
-        saved += batchIds.length;
+          await batch.commit();
+          savedBg += batchIds.length;
+        }
+        console.log(`📝 Background batched saving: ${savedBg} notifications`);
+      } catch (err) {
+        console.error('❌ Background batch save error:', err.message);
       }
-      console.log(`📝 Batched saving: ${saved} notifications`);
-    } catch (err) {
-      console.error('❌ Batch save error:', err.message);
-    }
+    })();
   }
 
-  return { sent, saved };
+  // Return immediately after FCM is sent, without waiting for Firestore save
+  return { sent, saved: uniqueUserIds.length };
 }
 
 // ==========================================
@@ -479,15 +482,14 @@ app.post('/api/notify-join', async (req, res) => {
 
     console.log(`\n🤝 Notify join: matchId=${matchId}, userId=${userId}`);
 
-    // Get joiner name & avatar
-    const userDoc = await db.collection('Users').doc(userId).get();
-    const userName = userDoc.exists ? userDoc.data().name : 'Player';
-    const userAvatar = userDoc.exists ? (userDoc.data().avatarUrl || '') : '';
+    // Get joiner name & avatar using Cache
+    const userData = await getCachedUser(userId);
+    const userName = userData ? userData.name : 'Player';
+    const userAvatar = userData ? (userData.avatarUrl || '') : '';
 
-    // Get match info
-    const matchDoc = await db.collection('Matches').doc(matchId).get();
-    if (!matchDoc.exists) return res.json({ success: true, sent: 0, reason: 'Match not found' });
-    const matchData = matchDoc.data();
+    // Get match info using Cache
+    const matchData = await getCachedDoc('Matches', matchId);
+    if (!matchData) return res.json({ success: true, sent: 0, reason: 'Match not found' });
     const matchName = matchData.name || 'Match';
     const leaderId = matchData.leaderId;
 
@@ -496,9 +498,9 @@ app.post('/api/notify-join', async (req, res) => {
     const userIds = [];
 
     if (leaderId && leaderId !== userId) {
-      const leaderDoc = await db.collection('Users').doc(leaderId).get();
-      if (leaderDoc.exists && leaderDoc.data().fcmToken) {
-        tokens.push(leaderDoc.data().fcmToken);
+      const leaderData = await getCachedUser(leaderId);
+      if (leaderData && leaderData.fcmToken) {
+        tokens.push(leaderData.fcmToken);
         userIds.push(leaderId);
       }
     }
@@ -542,64 +544,69 @@ app.post('/api/broadcast', async (req, res) => {
 
     console.log(`\n📢 Broadcast: "${title}" - "${message}"`);
 
-    const usersSnap = await db.collection('Users').get();
-    const tokens = [];
-    const userIds = [];
-    usersSnap.forEach(doc => {
-      if (doc.data().fcmToken) {
-        tokens.push(doc.data().fcmToken);
-        userIds.push(doc.id);
-      }
-    });
-
-    // Also save a global notification for users without tokens
-    await saveNotification({
-      userId: 'all',
-      title,
-      body: message,
-      type: 'global_broadcast',
-      targetId: '',
-      senderName: 'Admin'
-    });
-
-    if (tokens.length === 0) return res.json({ success: true, sent: 0, saved: 1 });
-
-    // Send FCM data-only
-    let sent = 0;
-    try {
-      // Chunk tokens in batches of 500 (Firebase limit)
-      const chunkSize = 500;
-      for (let i = 0; i < tokens.length; i += chunkSize) {
-        const tokenChunk = tokens.slice(i, i + chunkSize);
-        
-        const response = await admin.messaging().sendEachForMulticast({
-          data: {
-            title,
-            body: message,
-            type: 'global_broadcast',
-            senderName: 'Admin',
-            senderAvatar: '',
-            timestamp: Date.now().toString()
-          },
-          android: {
-            priority: 'high',
-            ttl: 86400000,
-          },
-          apns: {
-            headers: { 'apns-priority': '10' },
-            payload: { aps: { contentAvailable: true, sound: 'default', alert: { title, body: message } } }
-          },
-          tokens: tokenChunk
+    // Start background stream job to send Broadcast to all
+    (async () => {
+      try {
+        // Save a single global notification first
+        await saveNotification({
+          userId: 'all',
+          title,
+          body: message,
+          type: 'global_broadcast',
+          targetId: '',
+          senderName: 'Admin'
         });
-        
-        sent += response.successCount;
-      }
-      console.log(`📲 Broadcast FCM: ${sent}/${tokens.length}`);
-    } catch (err) {
-      console.error('❌ Broadcast FCM error:', err.message);
-    }
 
-    res.json({ success: true, sent, total: tokens.length });
+        let totalSent = 0;
+        let batchTokens = [];
+        // Stream users and ONLY select fcmToken to save memory & reduce read costs
+        const stream = db.collection('Users').select('fcmToken').stream();
+
+        const sendBatch = async (tokensToSend) => {
+          if (tokensToSend.length === 0) return;
+          try {
+            const response = await admin.messaging().sendEachForMulticast({
+              data: {
+                title,
+                body: message,
+                type: 'global_broadcast',
+                senderName: 'Admin',
+                senderAvatar: '',
+                timestamp: Date.now().toString()
+              },
+              android: { priority: 'high', ttl: 86400000 },
+              apns: { headers: { 'apns-priority': '10' }, payload: { aps: { contentAvailable: true, sound: 'default', alert: { title, body: message } } } },
+              tokens: tokensToSend
+            });
+            totalSent += response.successCount;
+          } catch (err) {
+            console.error('❌ FCM Batch Error:', err.message);
+          }
+        };
+
+        for await (const doc of stream) {
+          const fcmToken = doc.data().fcmToken;
+          if (fcmToken) {
+            batchTokens.push(fcmToken);
+            if (batchTokens.length >= 500) {
+              await sendBatch(batchTokens);
+              batchTokens = [];
+            }
+          }
+        }
+        
+        if (batchTokens.length > 0) {
+          await sendBatch(batchTokens);
+        }
+
+        console.log(`📢 Background Broadcast completed: Sent ${totalSent} FCM messages`);
+      } catch (err) {
+        console.error('❌ Background Broadcast Error:', err.message);
+      }
+    })();
+
+    // Return immediately without waiting for the large stream/FCM
+    res.json({ success: true, message: 'Broadcast started in background' });
   } catch (err) {
     console.error('[Broadcast Error]', err.message);
     res.status(500).json({ error: err.message });
@@ -973,8 +980,8 @@ app.post('/mute-user', async (req, res) => {
   try {
     const { userId, leaderId, matchId, durationMinutes } = req.body;
     if (!db) return res.status(500).json({ error: 'DB not available' });
-    const matchDoc = await db.collection('Matches').doc(matchId).get();
-    if (!matchDoc.exists || matchDoc.data().leaderId !== leaderId) {
+    const matchData = await getCachedDoc('Matches', matchId);
+    if (!matchData || matchData.leaderId !== leaderId) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
     const until = new Date();
@@ -1352,9 +1359,8 @@ app.post('/api/notify-new-login', async (req, res) => {
   const { uid, deviceName } = req.body;
   if (!uid || !deviceName) return res.status(400).json({ error: 'Missing data' });
   try {
-    const userDoc = await admin.firestore().collection('Users').doc(uid).get();
-    if (!userDoc.exists) return res.status(404).json({ error: 'User not found' });
-    const userData = userDoc.data();
+    const userData = await getCachedUser(uid);
+    if (!userData) return res.status(404).json({ error: 'User not found' });
     if (userData.fcmToken) {
       await sendFCMAndSave({
         tokens: [userData.fcmToken],
