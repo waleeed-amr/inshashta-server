@@ -452,7 +452,8 @@ app.post('/api/notify-message', async (req, res) => {
 
     // Get sender name & avatar via Cache
     const senderData = await getCachedUser(senderId);
-    const senderName = senderData ? senderData.name : 'User';
+    let senderName = senderData ? senderData.name : 'User';
+    const isSenderVerified = senderData && (senderData.isVerified || (senderData.badges && senderData.badges.includes('verified')));
     const senderAvatar = senderData ? (senderData.avatarUrl || '') : '';
 
     const isDM = matchId.startsWith('dm_');
@@ -517,7 +518,7 @@ app.post('/api/notify-message', async (req, res) => {
       userIds,
       title,
       body,
-      data: { matchId, type: msgType, chatName },
+      data: { matchId, type: msgType, chatName, senderName, senderAvatar, senderIsVerified: isSenderVerified ? 'true' : 'false' },
       type: msgType,
       targetId: matchId,
       senderName,
@@ -571,10 +572,10 @@ app.post('/api/notify-join', async (req, res) => {
     const result = await sendFCMAndSave({
       tokens,
       userIds,
-      title,
-      body,
-      data: { matchId, type: 'player_joined' },
-      type: 'player_joined',
+      title: 'تفاعل جديد',
+      body: body,
+      data: { matchId, type: 'chat_reaction', senderName: userName, senderAvatar: userAvatar, senderIsVerified: 'false' },
+      type: 'chat_reaction',
       targetId: matchId,
       senderName: userName,
       senderAvatar: userAvatar
@@ -814,9 +815,10 @@ app.post('/api/reply-message', async (req, res) => {
       readBy: [senderId]
     });
 
-    // 2. Get sender info for notification
+    // Get sender info via Cache
     const senderData = await getCachedUser(senderId);
-    const senderName = senderData ? senderData.name : 'User';
+    let senderName = senderData ? senderData.name : 'شخص';
+    const isSenderVerified = senderData && (senderData.isVerified || (senderData.badges && senderData.badges.includes('verified')));
     const senderAvatar = senderData ? (senderData.avatarUrl || '') : '';
 
     // 3. Collect recipient tokens
