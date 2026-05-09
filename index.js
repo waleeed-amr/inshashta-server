@@ -282,11 +282,10 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
           android: {
             priority: 'high',
             ttl: 86400000, // 24 hours
-            collapseKey: threadId, // Groups notifications in the background
+            // collapseKey removed to ensure every notification buzzes the phone
             notification: {
               sound: 'default',
-              channelId: 'in_shashta_messages_v2',
-              tag: threadId // Replaces previous notification from the same chat (prevents buzz spam)
+              channelId: 'in_shashta_messages_v2'
             }
           },
           apns: {
