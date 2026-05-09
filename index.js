@@ -604,74 +604,35 @@ app.post('/api/broadcast', async (req, res) => {
 
     console.log(`\n📢 Broadcast: "${title}" - "${message}"`);
 
-    // Start background stream job to send Broadcast to all
-    (async () => {
-      try {
-        // Save a single global notification first
-        await saveNotification({
-          userId: 'all',
-          title,
-          body: message,
-          type: 'global_broadcast',
-          targetId: '',
-          senderName: 'Admin'
-        });
-
-        let totalSent = 0;
-        let batchTokens = [];
-        // Stream users and ONLY select fcmToken to save memory & reduce read costs
-        const stream = db.collection('Users').select('fcmToken').stream();
-
-        const sendBatch = async (tokensToSend) => {
-          if (tokensToSend.length === 0) return;
-          try {
-            const response = await admin.messaging().sendEachForMulticast({
-              notification: {
-                title: title,
-                body: message
-              },
-              data: {
-                title,
-                body: message,
-                type: 'global_broadcast',
-                senderName: 'Admin',
-                senderAvatar: '',
-                timestamp: Date.now().toString()
-              },
-              android: { 
-                priority: 'high', 
-                ttl: 86400000,
-                notification: { sound: 'default' }
-              },
-              apns: { headers: { 'apns-priority': '10' }, payload: { aps: { contentAvailable: true, sound: 'default', alert: { title, body: message } } } },
-              tokens: tokensToSend
-            });
-            totalSent += response.successCount;
-          } catch (err) {
-            console.error('❌ FCM Batch Error:', err.message);
-          }
-        };
-
-        for await (const doc of stream) {
-          const fcmToken = doc.data().fcmToken;
-          if (fcmToken) {
-            batchTokens.push(fcmToken);
-            if (batchTokens.length >= 500) {
-              await sendBatch(batchTokens);
-              batchTokens = [];
-            }
-          }
-        }
-        
-        if (batchTokens.length > 0) {
-          await sendBatch(batchTokens);
-        }
-
-        console.log(`📢 Background Broadcast completed: Sent ${totalSent} FCM messages`);
-      } catch (err) {
-        console.error('❌ Background Broadcast Error:', err.message);
+    // Fetch all users with tokens and use the highly optimized sendFCMAndSave
+    const usersSnap = await db.collection('Users').select('fcmToken').get();
+    const tokens = [];
+    const userIds = [];
+    usersSnap.forEach(doc => {
+      const fcmToken = doc.data().fcmToken;
+      if (fcmToken) {
+        tokens.push(fcmToken);
+        userIds.push(doc.id);
       }
-    })();
+    });
+
+    console.log(`📢 Broadcasting to ${tokens.length} tokens...`);
+
+    if (tokens.length > 0) {
+      // Await the main wrapper (the FCM sending and saving will happen in parallel background)
+      const result = await sendFCMAndSave({
+        tokens,
+        userIds,
+        title,
+        body: message,
+        data: { type: 'global_broadcast', title, body: message },
+        type: 'global_broadcast',
+        targetId: 'all',
+        senderName: 'Admin',
+        senderAvatar: ''
+      });
+      console.log(`📢 Broadcast initiated for ${result.sent} devices.`);
+    }
 
     // Return immediately without waiting for the large stream/FCM
     res.json({ success: true, message: 'Broadcast started in background' });
@@ -769,6 +730,64 @@ app.post('/api/notify-status-reaction', async (req, res) => {
     res.json({ success: true, ...result });
   } catch (err) {
     console.error('[Notify Status Reaction Error]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==========================================
+// 3c. Notify Chat Reaction
+// ==========================================
+app.post('/api/notify-chat-reaction', async (req, res) => {
+  try {
+    if (!db) return res.status(500).json({ error: 'DB not available' });
+    const { matchId, targetUserId, senderId, emoji } = req.body;
+    if (!matchId || !targetUserId || !senderId || !emoji) {
+      return res.status(400).json({ error: 'matchId, targetUserId, senderId and emoji required' });
+    }
+
+    // Don't notify if reacting to own message
+    if (targetUserId === senderId) return res.json({ success: true, sent: 0, reason: 'Own message' });
+
+    console.log(`\n💖 Notify Chat Reaction: matchId=${matchId}, target=${targetUserId}, sender=${senderId}, emoji=${emoji}`);
+
+    const senderData = await getCachedUser(senderId);
+    const senderName = senderData ? senderData.name : 'مستخدم';
+    
+    const targetData = await getCachedUser(targetUserId);
+    if (!targetData || !targetData.fcmToken) return res.json({ success: true, sent: 0, reason: 'No token' });
+
+    const isDM = matchId.startsWith('dm_');
+    const isGroup = matchId.startsWith('group_');
+    let chatName = '';
+    
+    if (isGroup) {
+      const groupData = await getCachedDoc('Groups', matchId.replace('group_', ''));
+      chatName = groupData?.name || 'مجموعة';
+    } else if (!isDM) {
+      const matchData = await getCachedDoc('Matches', matchId);
+      chatName = matchData?.name || 'مباراة';
+    }
+
+    const title = isDM ? 'تفاعل جديد' : chatName;
+    const body = `لقد تفاعل ${senderName} مع رسالتك بـ ${emoji}`;
+
+    const msgType = isDM ? 'dm_message' : (isGroup ? 'group_message' : 'chat_message');
+
+    const result = await sendFCMAndSave({
+      tokens: [targetData.fcmToken],
+      userIds: [targetUserId],
+      title,
+      body,
+      data: { matchId, type: msgType, chatName },
+      type: msgType,
+      targetId: matchId,
+      senderName,
+      senderAvatar: senderData?.avatarUrl || ''
+    });
+
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[Notify Chat Reaction Error]', err.message);
     res.status(500).json({ error: err.message });
   }
 });
