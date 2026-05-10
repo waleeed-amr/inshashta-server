@@ -234,8 +234,8 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
     return { sent: 0, saved: 0 };
   }
 
-  // ========== STEP 1: Send FCM in BACKGROUND ==========
-  (async () => {
+  // ========== Execute FCM and DB Save in Parallel ==========
+  const fcmPromise = (async () => {
     try {
       // 1. Chunk tokens into arrays of 500 (Firebase Multicast Limit)
       const CHUNK_SIZE = 500;
@@ -346,11 +346,11 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
     } catch (err) {
       console.error('❌ [Background FCM Error]:', err.message);
     }
-  })(); // Start immediately without awaiting
+  })(); // Wrap in promise
 
-  // ========== STEP 2: Save to Firestore in BACKGROUND ==========
-  if (db && uniqueUserIds && uniqueUserIds.length > 0) {
-    (async () => {
+  // ========== Save to Firestore ==========
+  const dbPromise = (async () => {
+    if (!db || !uniqueUserIds || uniqueUserIds.length === 0) return;
       try {
         let savedBg = 0;
         for (let i = 0; i < uniqueUserIds.length; i += 400) {
@@ -378,9 +378,20 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
         console.error('❌ [Background DB Error]:', err.message);
       }
     })();
-  }
 
-  // Return INSTANTLY to the client so API feels zero-latency
+  // Wait for both operations to complete so Vercel doesn't kill them,
+  // BUT enforce an 8-second timeout to prevent hitting Vercel's 10-second hard limit (504 Gateway Timeout).
+  const timeoutPromise = new Promise(resolve => setTimeout(() => {
+    console.log('⚠️ [Vercel Protection] FCM/DB tasks exceeded 8 seconds. Returning early to prevent 504 error.');
+    resolve('timeout');
+  }, 8000));
+
+  await Promise.race([
+    Promise.allSettled([fcmPromise, dbPromise]),
+    timeoutPromise
+  ]);
+
+  // Return to client
   return { sent: uniqueTokens.length, saved: uniqueUserIds.length };
 }
 
@@ -452,7 +463,13 @@ app.post('/api/notify-message', async (req, res) => {
     // Get sender name & avatar via Cache
     const senderData = await getCachedUser(senderId);
     let senderName = senderData ? senderData.name : 'User';
-    const isSenderVerified = senderData && (senderData.isVerified || (senderData.badges && senderData.badges.includes('verified')));
+    const isSenderVerified = senderData && (senderData.isVerified === true || (Array.isArray(senderData.badges) && senderData.badges.includes('verified')));
+    
+    // Add verification badge directly to the sender name so it appears perfectly in Android/iOS push notifications
+    if (isSenderVerified) {
+      senderName = senderName + ' ✅';
+    }
+    
     const senderAvatar = senderData ? (senderData.avatarUrl || '') : '';
 
     const isDM = matchId.startsWith('dm_');
