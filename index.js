@@ -407,8 +407,7 @@ app.get('/api/cloudinary-sign', (req, res) => {
     const cloudName = "dd07kmewo";
     
     // Cloudinary signature requires params to be alphabetically sorted
-    // timestamp before transformation (t-i before t-r)
-    const signature = crypto.createHash('sha1').update(`timestamp=${timestamp}&transformation=w_256,h_256,c_fit,f_png${apiSecret}`).digest('hex');
+    const signature = crypto.createHash('sha1').update(`timestamp=${timestamp}${apiSecret}`).digest('hex');
     
     res.json({
       signature,
