@@ -922,14 +922,15 @@ app.get('/api/stats', (req, res) => {
 
 // ==========================================
 // 4. Delete Message Notification (Overwrite Tray)
+// Supports admin deletion: pass isAdminDelete=true and adminName to show who deleted
 // ==========================================
 app.post('/api/delete-notification', async (req, res) => {
   try {
     if (!db) return res.status(500).json({ error: 'DB not available' });
-    const { matchId } = req.body;
+    const { matchId, isAdminDelete, adminName } = req.body;
     if (!matchId) return res.status(400).json({ error: 'matchId required' });
     
-    console.log(`\n🗑️ Delete notification requested for: matchId=${matchId}`);
+    console.log(`\n🗑️ Delete notification requested for: matchId=${matchId}${isAdminDelete ? ` (Admin: ${adminName})` : ''}`);
 
     const isDM = matchId.startsWith('dm_');
     const isGroup = matchId.startsWith('group_');
@@ -962,11 +963,15 @@ app.post('/api/delete-notification', async (req, res) => {
 
     if (tokens.length === 0) return res.json({ success: true, sent: 0, reason: 'No tokens found' });
 
+    const deleteBody = isAdminDelete 
+      ? `🛡️ تم حذف رسالة بواسطة المشرف ${adminName || ''}`
+      : '🚫 تم حذف هذه الرسالة';
+
     // Send a message that overwrites the notification tag with "Message deleted"
     const response = await admin.messaging().sendEachForMulticast({
       data: {
         title: 'تنبيه',
-        body: '🚫 تم حذف هذه الرسالة',
+        body: deleteBody,
         type: 'delete_message',
         matchId,
         timestamp: Date.now().toString()
