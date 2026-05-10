@@ -261,32 +261,33 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
             if (urlMatch) imageUrl = urlMatch[0];
         }
 
+        // Ensure all data values are strings (FCM requirement)
+        const rawData = {
+          ...(data || {}),
+          title: title || '',
+          body: body || '',
+          senderName: senderName || '',
+          senderAvatar: senderAvatar || '',
+          type: type || 'general',
+          targetId: targetId || '',
+          timestamp: Date.now().toString(),
+          channelId: 'in_shashta_messages_v2'
+        };
+        const stringifiedData = {};
+        for (const key in rawData) {
+          if (rawData[key] !== undefined && rawData[key] !== null) {
+            stringifiedData[key] = String(rawData[key]);
+          }
+        }
+
         const payload = {
-          // 'notification' block guarantees instant delivery on Android
-          notification: {
-            title: title || '',
-            body: body || '',
-            ...(imageUrl ? { imageUrl } : {})
-          },
-          data: {
-            ...(data || {}),
-            title: title || '',
-            body: body || '',
-            senderName: senderName || '',
-            senderAvatar: senderAvatar || '',
-            type: type || 'general',
-            targetId: targetId || '',
-            timestamp: Date.now().toString(),
-            channelId: 'in_shashta_messages_v2'
-          },
+          // IMPORTANT: NO 'notification' block here.
+          // We use DATA-ONLY messages so MyFirebaseMessagingService.java
+          // handles it in the background to build rich notifications with inline replies.
+          data: stringifiedData,
           android: {
             priority: 'high',
-            ttl: 86400000, // 24 hours
-            // collapseKey removed to ensure every notification buzzes the phone
-            notification: {
-              sound: 'default',
-              channelId: 'in_shashta_messages_v2'
-            }
+            ttl: 86400000 // 24 hours
           },
           apns: {
             headers: { 
