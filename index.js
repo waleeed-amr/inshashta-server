@@ -26,6 +26,8 @@ try {
 }
 const app = express();
 app.use(cors());
+// Base64 profile photos use this JSON route too, so preserve its 10 MB payload
+// ceiling while bounding the in-memory IP limiter separately below.
 app.use(express.json({ limit: '10mb' }));
 
 // ==========================================
@@ -45,15 +47,22 @@ app.use((req, res, next) => {
 const rateLimitMap = new Map();
 const RATE_LIMIT_WINDOW = 60000; // 1 minute
 const MAX_REQUESTS = 150; // max requests per minute
+const MAX_RATE_LIMIT_KEYS = 20000;
 
 app.use('/api', (req, res, next) => {
   // Allow health/warm requests unconditionally
   if (req.path === '/warm' || req.path === '/health' || req.method === 'GET') return next();
   
-  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  // Express only trusts forwarded addresses when trust proxy is configured.
+  // Bound the key length and map size so spoofed headers cannot grow memory forever.
+  const ip = String(req.ip || req.socket.remoteAddress || 'unknown').slice(0, 64);
   const now = Date.now();
   
   if (!rateLimitMap.has(ip)) {
+    if (rateLimitMap.size >= MAX_RATE_LIMIT_KEYS) {
+      const oldestKey = rateLimitMap.keys().next().value;
+      if (oldestKey !== undefined) rateLimitMap.delete(oldestKey);
+    }
     rateLimitMap.set(ip, { count: 1, startTime: now });
   } else {
     const data = rateLimitMap.get(ip);
@@ -72,7 +81,7 @@ app.use('/api', (req, res, next) => {
 });
 
 // Clean up expired IPs from rateLimitMap every 5 minutes
-setInterval(() => {
+const rateLimitCleanup = setInterval(() => {
   const now = Date.now();
   for (const [ip, data] of rateLimitMap.entries()) {
     if (now - data.startTime > RATE_LIMIT_WINDOW) {
@@ -80,6 +89,8 @@ setInterval(() => {
     }
   }
 }, 5 * 60 * 1000);
+// Housekeeping must not keep serverless runtimes alive after the response ends.
+rateLimitCleanup.unref?.();
 
 // ==========================================
 // 🛡️ ASYNC HANDLER (Try-Catch Wrapper)
@@ -118,7 +129,7 @@ const CacheStore = new Map();
 const CACHE_TTL = 15000;
 
 // Garbage collection to clean up expired cache items and prevent memory leaks
-setInterval(() => {
+const cacheCleanup = setInterval(() => {
   const now = Date.now();
   for (const [key, value] of CacheStore.entries()) {
     if (now - value.time > CACHE_TTL) {
@@ -126,6 +137,7 @@ setInterval(() => {
     }
   }
 }, 60000); // Run every 60 seconds
+cacheCleanup.unref?.();
 
 async function getCachedUser(uid) {
   if (!uid) return null;
@@ -901,15 +913,66 @@ app.post('/api/reply-message', async (req, res) => {
 });
 
 // ==========================================
+// ==========================================
+// WebRTC: Short-lived TURN credentials (Open Relay free tier)
+// ==========================================
+app.get('/api/webrtc/ice', async (req, res) => {
+  if (!db || !admin.apps.length) return res.status(503).json({ error: 'Authentication service is unavailable' });
+  const bearer = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i);
+  if (!bearer) return res.status(401).json({ error: 'Authentication required' });
+  try {
+    await admin.auth().verifyIdToken(bearer[1]);
+  } catch {
+    return res.status(401).json({ error: 'Invalid authentication token' });
+  }
+
+  const credentialsUrl = process.env.OPENRELAY_CREDENTIALS_URL;
+  if (!credentialsUrl) return res.status(503).json({ error: 'TURN credentials are not configured' });
+  let parsedCredentialsUrl;
+  try { parsedCredentialsUrl = new URL(credentialsUrl); }
+  catch { return res.status(503).json({ error: 'TURN credentials URL is invalid' }); }
+  if (parsedCredentialsUrl.protocol !== 'https:' || !parsedCredentialsUrl.hostname.endsWith('.metered.live')) {
+    return res.status(503).json({ error: 'TURN credentials URL must be an HTTPS Metered endpoint' });
+  }
+
+  try {
+    const response = await fetch(parsedCredentialsUrl, { signal: AbortSignal.timeout(6000) });
+    if (!response.ok) return res.status(502).json({ error: 'TURN provider rejected the credentials request' });
+    const iceServers = await response.json();
+    if (!Array.isArray(iceServers) || !iceServers.length || !iceServers.some((server) => server?.urls)) {
+      return res.status(502).json({ error: 'TURN provider returned an invalid ICE configuration' });
+    }
+    res.set('Cache-Control', 'no-store');
+    return res.json({ iceServers });
+  } catch (error) {
+    console.error('[WebRTC TURN Error]', error.message);
+    return res.status(502).json({ error: 'TURN provider is temporarily unavailable' });
+  }
+});
+
+// ==========================================
 // WebRTC: Notify Incoming Call
 // ==========================================
 app.post('/api/notify-call', async (req, res) => {
   try {
-    if (!db) return res.status(500).json({ error: 'DB not available' });
-    const { callerId, calleeId, callId, callerName, callerAvatar } = req.body;
+    if (!db || !admin.apps.length) return res.status(503).json({ error: 'DB not available' });
+    const bearer = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i);
+    if (!bearer) return res.status(401).json({ error: 'Authentication required' });
+    let authenticatedUser;
+    try { authenticatedUser = await admin.auth().verifyIdToken(bearer[1]); }
+    catch { return res.status(401).json({ error: 'Invalid authentication token' }); }
+    const { callerId, calleeId, callId } = req.body;
     if (!callerId || !calleeId || !callId) {
       return res.status(400).json({ error: 'callerId, calleeId, and callId required' });
     }
+    if (authenticatedUser.uid !== callerId) return res.status(403).json({ error: 'Caller identity mismatch' });
+    const callSnapshot = await db.collection('WebRTCCalls').doc(String(callId)).get();
+    if (!callSnapshot.exists || callSnapshot.data().callerId !== callerId || callSnapshot.data().calleeId !== calleeId || callSnapshot.data().status !== 'ringing') {
+      return res.status(403).json({ error: 'Invalid call invitation' });
+    }
+    const callData = callSnapshot.data();
+    const callerName = String(callData.callerName || 'مستخدم').slice(0, 64);
+    const callerAvatar = String(callData.callerAvatar || '').slice(0, 1024);
 
     console.log(`\n📞 Incoming Call: from ${callerId} to ${calleeId} (CallID: ${callId})`);
 
@@ -927,7 +990,7 @@ app.post('/api/notify-call', async (req, res) => {
       userIds: [calleeId],
       title,
       body,
-      data: { type: 'INCOMING_CALL', callId, callerId, callerName: callerName || '', callerAvatar: callerAvatar || '' },
+      data: { type: 'INCOMING_CALL', callId, callerId, callerName: callerName || '', callerAvatar: callerAvatar || '', callType: 'audio' },
       type: 'INCOMING_CALL',
       targetId: callerId,
       senderName: callerName || '',
@@ -1494,7 +1557,7 @@ in shashta هو تطبيق دردشة وسوشيال ميديا بين الأص�
 }));
 
 // Clean up AI rate limit map every 5 minutes
-setInterval(() => {
+const aiRateLimitCleanup = setInterval(() => {
   const now = Date.now();
   for (const [key, data] of aiRateLimitMap.entries()) {
     if (now - data.startTime > AI_RATE_LIMIT_WINDOW) {
@@ -1502,6 +1565,7 @@ setInterval(() => {
     }
   }
 }, 5 * 60 * 1000);
+aiRateLimitCleanup.unref?.();
 
 // ==========================================
 // 🔔 SECURITY: NEW LOGIN NOTIFICATION
