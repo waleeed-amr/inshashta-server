@@ -917,6 +917,7 @@ app.post('/api/reply-message', async (req, res) => {
 // WebRTC: Short-lived TURN credentials (Open Relay free tier)
 // ==========================================
 app.get('/api/webrtc/ice', async (req, res) => {
+  res.set('Cache-Control', 'no-store, private');
   if (!db || !admin.apps.length) return res.status(503).json({ error: 'Authentication service is unavailable' });
   const bearer = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i);
   if (!bearer) return res.status(401).json({ error: 'Authentication required' });
@@ -938,14 +939,34 @@ app.get('/api/webrtc/ice', async (req, res) => {
   try {
     const response = await fetch(parsedCredentialsUrl, { signal: AbortSignal.timeout(6000) });
     if (!response.ok) return res.status(502).json({ error: 'TURN provider rejected the credentials request' });
-    const iceServers = await response.json();
-    if (!Array.isArray(iceServers) || !iceServers.length || !iceServers.some((server) => server?.urls)) {
+    const contentLength = Number(response.headers.get('content-length') || 0);
+    if (contentLength > 32 * 1024) return res.status(502).json({ error: 'TURN provider returned an oversized response' });
+    const responseBody = await response.text();
+    if (responseBody.length > 32 * 1024) return res.status(502).json({ error: 'TURN provider returned an oversized response' });
+
+    let providerServers;
+    try { providerServers = JSON.parse(responseBody); }
+    catch { return res.status(502).json({ error: 'TURN provider returned invalid JSON' }); }
+    if (!Array.isArray(providerServers) || providerServers.length > 20) {
       return res.status(502).json({ error: 'TURN provider returned an invalid ICE configuration' });
     }
-    res.set('Cache-Control', 'no-store');
+
+    // Only forward well-formed ICE URLs. Do not silently accept a provider
+    // response containing STUN only: it would look configured while calls
+    // behind restrictive NATs still cannot use the relay.
+    const iceServers = providerServers.filter((server) => {
+      if (!server || typeof server !== 'object') return false;
+      const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
+      if (!urls.length || urls.length > 12 || urls.some((url) => typeof url !== 'string' || url.length > 512 || !/^(stun|stuns|turn|turns):/i.test(url))) return false;
+      const hasTurn = urls.some((url) => /^turns?:/i.test(url));
+      return !hasTurn || (typeof server.username === 'string' && server.username.length > 0 && typeof server.credential === 'string' && server.credential.length > 0);
+    });
+    if (!iceServers.length || !iceServers.some((server) => (Array.isArray(server.urls) ? server.urls : [server.urls]).some((url) => /^turns?:/i.test(url)))) {
+      return res.status(502).json({ error: 'TURN provider returned no usable relay credentials' });
+    }
     return res.json({ iceServers });
   } catch (error) {
-    console.error('[WebRTC TURN Error]', error.message);
+    console.error('[WebRTC TURN Error]', error.name === 'TimeoutError' ? 'provider timeout' : 'provider request failed');
     return res.status(502).json({ error: 'TURN provider is temporarily unavailable' });
   }
 });
