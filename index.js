@@ -414,8 +414,19 @@ app.post('/api/notify-message', async (req, res) => {
 
     console.log(`\n📨 Notify message: matchId=${matchId}, senderId=${senderId}`);
 
-    // Get sender name & avatar via Cache
-    const senderData = await getCachedUser(senderId);
+    const isDM = matchId.startsWith('dm_');
+    const isGroup = matchId.startsWith('group_');
+    const directRecipientId = isDM
+      ? matchId.replace('dm_', '').split('_').find((id) => id !== senderId)
+      : null;
+
+    // The sender profile and the DM recipient token are independent reads.
+    // Fetch them together so a cold Firestore cache doesn't add two network
+    // round trips to every first message in a conversation.
+    const [senderData, directRecipientData] = await Promise.all([
+      getCachedUser(senderId),
+      directRecipientId ? getCachedUser(directRecipientId) : Promise.resolve(null),
+    ]);
     let senderName = senderData ? senderData.name : 'User';
     const isSenderVerified = senderData && (senderData.isVerified === true || (Array.isArray(senderData.badges) && senderData.badges.includes('verified')));
     
@@ -426,18 +437,15 @@ app.post('/api/notify-message', async (req, res) => {
     
     const senderAvatar = senderData ? (senderData.avatarUrl || '') : '';
 
-    const isDM = matchId.startsWith('dm_');
-    const isGroup = matchId.startsWith('group_');
     const tokens = [];
     const userIds = [];
     let chatName = '';
 
     if (isDM) {
       // DM: get the other user's token
-      const parts = matchId.replace('dm_', '').split('_');
-      const otherUid = parts.find(p => p !== senderId);
+      const otherUid = directRecipientId;
       if (otherUid) {
-        const otherData = await getCachedUser(otherUid);
+        const otherData = directRecipientData;
         if (otherData && otherData.fcmToken) {
           tokens.push(otherData.fcmToken);
           userIds.push(otherUid);
