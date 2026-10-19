@@ -243,168 +243,110 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
 
   if (uniqueTokens.length === 0) {
     console.log('⚠️ No tokens to send to');
-    return { sent: 0, saved: 0 };
+    return { sent: 0, failed: 0, saved: 0, timedOut: false, errors: [] };
   }
 
-  // ========== Execute FCM and DB Save in Parallel ==========
   const fcmPromise = (async () => {
-    try {
-      // 1. Chunk tokens into arrays of 500 (Firebase Multicast Limit)
-      const CHUNK_SIZE = 500;
-      const chunks = [];
-      for (let i = 0; i < uniqueTokens.length; i += CHUNK_SIZE) {
-        chunks.push(uniqueTokens.slice(i, i + CHUNK_SIZE));
-      }
-
-      const invalidUserIds = new Set();
-      let totalSent = 0;
-
-      // 2. Send chunks in parallel
-      const sendPromises = chunks.map(async (tokenChunk, chunkIndex) => {
-        // 🚀 QUANTUM LEAP: Smart Grouping (Threading & Collapsing)
-        const threadId = targetId || 'inshashta_general';
-
-        // 🚀 QUANTUM LEAP: Rich Notification Image Detection
-        let imageUrl = undefined;
-        if (data && data.imageUrl) imageUrl = data.imageUrl;
-        else if (data && data.image) imageUrl = data.image;
-        else if (body && (body.includes('.jpg') || body.includes('.png') || body.includes('.jpeg') || body.includes('.gif'))) {
-            const urlMatch = body.match(/https?:\/\/[^\s]+?\.(jpg|jpeg|png|gif)/i);
-            if (urlMatch) imageUrl = urlMatch[0];
-        }
-
-        // Ensure all data values are strings (FCM requirement)
-        const rawData = {
-          ...(data || {}),
-          title: title || '',
-          body: body || '',
-          senderName: senderName || '',
-          senderAvatar: senderAvatar || '',
-          type: type || 'general',
-          targetId: targetId || '',
-          timestamp: Date.now().toString(),
-          channelId: 'in_shashta_messages_v2'
-        };
-        const stringifiedData = {};
-        for (const key in rawData) {
-          if (rawData[key] !== undefined && rawData[key] !== null) {
-            stringifiedData[key] = String(rawData[key]);
-          }
-        }
-
-        const payload = {
-          // IMPORTANT: NO 'notification' block here.
-          // We use DATA-ONLY messages so MyFirebaseMessagingService.java
-          // handles it in the background to build rich notifications with inline replies.
-          data: stringifiedData,
-          android: {
-            priority: 'high',
-            ttl: 86400000 // 24 hours
+    const CHUNK_SIZE = 500;
+    const chunks = [];
+    for (let i = 0; i < uniqueTokens.length; i += CHUNK_SIZE) chunks.push(uniqueTokens.slice(i, i + CHUNK_SIZE));
+    const invalidUserIds = new Set();
+    const errors = [];
+    let totalSent = 0;
+    let totalFailed = 0;
+    const sends = chunks.map(async (tokenChunk, chunkIndex) => {
+      const threadId = targetId || 'inshashta_general';
+      const isIncomingCall = type === 'INCOMING_CALL';
+      const rawData = {
+        ...(data || {}), title: title || '', body: body || '', senderName: senderName || '',
+        senderAvatar: senderAvatar || '', type: type || 'general', targetId: targetId || '',
+        timestamp: Date.now().toString(), channelId: isIncomingCall ? 'in_shashta_calls_v2' : 'in_shashta_messages_v2',
+      };
+      const stringifiedData = Object.fromEntries(Object.entries(rawData)
+        .filter(([, value]) => value !== undefined && value !== null)
+        .map(([key, value]) => [key, String(value)]));
+      const payload = {
+        data: stringifiedData,
+        android: {
+          priority: 'high',
+          ttl: isIncomingCall ? 45_000 : 86_400_000,
+          ...(isIncomingCall ? { collapseKey: 'in_shashta_incoming_call' } : {}),
+        },
+        apns: {
+          headers: {
+            'apns-priority': '10',
+            'apns-collapse-id': (isIncomingCall ? 'inshashta-incoming-call' : threadId).slice(0, 64),
+            ...(isIncomingCall ? { 'apns-expiration': String(Math.floor(Date.now() / 1000) + 45) } : {}),
           },
-          apns: {
-            headers: { 
-              'apns-priority': '10',
-              'apns-collapse-id': threadId.substring(0, 64) // APNS limit is 64 bytes
-            },
-            payload: {
-              aps: {
-                contentAvailable: true,
-                sound: 'default',
-                'thread-id': threadId,
-                alert: { title, body }
-              }
-            }
-          },
-          tokens: tokenChunk
-        };
-
-        const response = await admin.messaging().sendEachForMulticast(payload);
-        totalSent += response.successCount;
-
-        // Collect invalid tokens for batched cleanup
-        response.responses.forEach((resp, idx) => {
-          if (!resp.success) {
-            const errCode = resp.error?.code;
-            if (errCode === 'messaging/invalid-registration-token' ||
-                errCode === 'messaging/registration-token-not-registered') {
-              // Calculate original index to find correct userId
-              const originalIndex = (chunkIndex * CHUNK_SIZE) + idx;
-              if (uniqueUserIds[originalIndex]) {
-                invalidUserIds.add(uniqueUserIds[originalIndex]);
-              }
-            }
-          }
-        });
+          payload: { aps: { contentAvailable: true, sound: 'default', 'thread-id': threadId, alert: { title, body } } },
+        },
+        tokens: tokenChunk,
+      };
+      const response = await admin.messaging().sendEachForMulticast(payload);
+      totalSent += response.successCount;
+      totalFailed += response.failureCount;
+      response.responses.forEach((item, idx) => {
+        if (item.success) return;
+        const code = item.error?.code || 'messaging/unknown-error';
+        if (!errors.includes(code) && errors.length < 8) errors.push(code);
+        if (code === 'messaging/invalid-registration-token' || code === 'messaging/registration-token-not-registered') {
+          const userId = uniqueUserIds[chunkIndex * CHUNK_SIZE + idx];
+          if (userId) invalidUserIds.add(userId);
+        }
       });
-
-      await Promise.allSettled(sendPromises);
-      console.log(`🚀 [Background FCM] Sent: ${totalSent}/${uniqueTokens.length} to "${title}"`);
-
-      // 3. Batch DB cleanup for invalid tokens
-      if (invalidUserIds.size > 0 && db) {
-        const invalidIdsArr = Array.from(invalidUserIds);
-        console.log(`🧹 [Background Cleanup] Removing ${invalidIdsArr.length} invalid tokens...`);
-        for (let i = 0; i < invalidIdsArr.length; i += 400) {
-          const batchIds = invalidIdsArr.slice(i, i + 400);
-          const batch = db.batch();
-          batchIds.forEach(uid => {
-            const docRef = db.collection('Users').doc(uid);
-            batch.update(docRef, { fcmToken: admin.firestore.FieldValue.delete() });
-          });
-          await batch.commit();
-        }
+    });
+    const results = await Promise.allSettled(sends);
+    results.forEach((result, index) => {
+      if (result.status === 'rejected') {
+        totalFailed += chunks[index].length;
+        const code = result.reason?.code || 'messaging/request-failed';
+        if (!errors.includes(code) && errors.length < 8) errors.push(code);
       }
-
-    } catch (err) {
-      console.error('❌ [Background FCM Error]:', err.message);
+    });
+    if (invalidUserIds.size && db) {
+      for (const uid of invalidUserIds) {
+        try { await db.collection('Users').doc(uid).update({ fcmToken: admin.firestore.FieldValue.delete() }); }
+        catch (error) { console.warn('[FCM] Could not remove invalid token for user:', uid, error.code || error.message); }
+      }
     }
-  })(); // Wrap in promise
+    console.log(`[FCM] ${type || 'general'} delivered ${totalSent}/${uniqueTokens.length}; failed=${totalFailed}`);
+    return { sent: totalSent, failed: totalFailed, errors };
+  })().catch((error) => {
+    console.error('[FCM] Sending failed:', error.code || error.message);
+    return { sent: 0, failed: uniqueTokens.length, errors: [error.code || 'messaging/request-failed'] };
+  });
 
-  // ========== Save to Firestore ==========
   const dbPromise = (async () => {
-    if (!db || !uniqueUserIds || uniqueUserIds.length === 0) return;
-      try {
-        let savedBg = 0;
-        for (let i = 0; i < uniqueUserIds.length; i += 400) {
-          const batchIds = uniqueUserIds.slice(i, i + 400);
-          const batch = db.batch();
-          batchIds.forEach(uid => {
-            const docRef = db.collection('Notifications').doc();
-            batch.set(docRef, {
-              userId: uid,
-              title,
-              body,
-              type: type || 'general',
-              targetId: targetId || '',
-              senderName: senderName || '',
-              senderAvatar: senderAvatar || '',
-              read: false,
-              createdAt: admin.firestore.FieldValue.serverTimestamp()
-            });
-          });
-          await batch.commit();
-          savedBg += batchIds.length;
-        }
-        console.log(`📝 [Background DB] Saved ${savedBg} notifications`);
-      } catch (err) {
-        console.error('❌ [Background DB Error]:', err.message);
+    if (!db || uniqueUserIds.length === 0) return { saved: 0, error: db ? null : 'firestore-unavailable' };
+    let saved = 0;
+    try {
+      for (let i = 0; i < uniqueUserIds.length; i += 400) {
+        const batchIds = uniqueUserIds.slice(i, i + 400);
+        const batch = db.batch();
+        batchIds.forEach(uid => batch.set(db.collection('Notifications').doc(), {
+          userId: uid, title, body, type: type || 'general', targetId: targetId || '',
+          senderName: senderName || '', senderAvatar: senderAvatar || '', read: false,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        }));
+        await batch.commit();
+        saved += batchIds.length;
       }
-    })();
+      return { saved, error: null };
+    } catch (error) {
+      console.error('[Notification DB] Save failed:', error.code || error.message);
+      return { saved, error: error.code || 'firestore-write-failed' };
+    }
+  })();
 
-  // Wait for both operations to complete so Vercel doesn't kill them,
-  // BUT enforce an 8-second timeout to prevent hitting Vercel's 10-second hard limit (504 Gateway Timeout).
-  const timeoutPromise = new Promise(resolve => setTimeout(() => {
-    console.log('⚠️ [Vercel Protection] FCM/DB tasks exceeded 8 seconds. Returning early to prevent 504 error.');
-    resolve('timeout');
-  }, 8000));
-
-  await Promise.race([
-    Promise.allSettled([fcmPromise, dbPromise]),
-    timeoutPromise
+  let timeoutId;
+  const tasks = Promise.all([fcmPromise, dbPromise]);
+  const result = await Promise.race([
+    tasks,
+    new Promise((resolve) => { timeoutId = setTimeout(() => resolve(null), 8_000); }),
   ]);
-
-  // Return to client
-  return { sent: uniqueTokens.length, saved: uniqueUserIds.length };
+  if (timeoutId) clearTimeout(timeoutId);
+  if (!result) return { sent: 0, failed: uniqueTokens.length, saved: 0, timedOut: true, errors: ['delivery-timeout'] };
+  return { ...result[0], ...result[1], timedOut: false };
 }
 
 // ==========================================
@@ -982,8 +924,8 @@ app.post('/api/notify-call', async (req, res) => {
     let authenticatedUser;
     try { authenticatedUser = await admin.auth().verifyIdToken(bearer[1]); }
     catch { return res.status(401).json({ error: 'Invalid authentication token' }); }
-    const { callerId, calleeId, callId } = req.body;
-    if (!callerId || !calleeId || !callId) {
+    const { callerId, calleeId, callId } = req.body || {};
+    if (![callerId, calleeId, callId].every(value => typeof value === 'string' && value.length > 0 && value.length <= 160)) {
       return res.status(400).json({ error: 'callerId, calleeId, and callId required' });
     }
     if (authenticatedUser.uid !== callerId) return res.status(403).json({ error: 'Caller identity mismatch' });
@@ -999,7 +941,8 @@ app.post('/api/notify-call', async (req, res) => {
 
     const calleeData = await getCachedUser(calleeId);
     if (!calleeData || !calleeData.fcmToken) {
-       return res.json({ success: false, reason: 'Callee has no token' });
+       console.warn(`[Notify Call] Callee has no registered push token: ${calleeId}`);
+       return res.status(409).json({ success: false, reason: 'callee_no_push_token', sent: 0 });
     }
 
     const title = 'مكالمة واردة';
@@ -1011,14 +954,18 @@ app.post('/api/notify-call', async (req, res) => {
       userIds: [calleeId],
       title,
       body,
-      data: { type: 'INCOMING_CALL', callId, callerId, callerName: callerName || '', callerAvatar: callerAvatar || '', callType: 'audio' },
+      data: { type: 'INCOMING_CALL', callId, callerId, calleeId, callerName: callerName || '', callerAvatar: callerAvatar || '', callType: 'audio' },
       type: 'INCOMING_CALL',
       targetId: callerId,
       senderName: callerName || '',
       senderAvatar: callerAvatar || ''
     });
 
-    res.json({ success: true, ...result });
+    if (result.timedOut || result.sent === 0) {
+      console.error(`[Notify Call] Push delivery failed for call ${callId}:`, JSON.stringify(result));
+      return res.status(502).json({ success: false, reason: 'push_delivery_failed', ...result });
+    }
+    return res.json({ success: result.failed === 0, ...result });
   } catch (err) {
     console.error('[Notify Call Error]', err.message);
     res.status(500).json({ error: err.message });
@@ -1311,6 +1258,162 @@ app.get('/api/health', async (req, res) => {
   }
 
   res.json(health);
+});
+
+// Authenticated, privacy-bounded client diagnostics. Reports are written by
+// Admin SDK and can only be listed/triaged by the designated admin account.
+const consoleIssueRateMap = new Map();
+const CONSOLE_ADMIN_EMAIL = '01022763613@inshashta.app';
+const consoleIssueRateCleanup = setInterval(() => {
+  const now = Date.now();
+  for (const [uid, rate] of consoleIssueRateMap.entries()) {
+    if (now - rate.start > 60_000) consoleIssueRateMap.delete(uid);
+  }
+}, 5 * 60 * 1000);
+consoleIssueRateCleanup.unref?.();
+function cleanConsoleIssueText(value, maxLength) {
+  if (typeof value !== 'string') return '';
+  return value
+    .replace(/(authorization\s*[:=]\s*bearer\s+)[\w.-]+/gi, '$1[REDACTED]')
+    .replace(/((?:password|token|secret|api[_-]?key)\s*["']?\s*[:=]\s*["']?)[^\s,"'}]+/gi, '$1[REDACTED]')
+    .slice(0, maxLength);
+}
+
+async function verifyConsoleIssueCaller(req, res, requireAdmin = false) {
+  const token = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i)?.[1];
+  if (!token) {
+    res.status(401).json({ error: 'Authentication required' });
+    return null;
+  }
+  try {
+    const identity = await admin.auth().verifyIdToken(token);
+    if (requireAdmin && String(identity.email || '').toLowerCase() !== CONSOLE_ADMIN_EMAIL) {
+      res.status(403).json({ error: 'Admin access required' });
+      return null;
+    }
+    return identity;
+  } catch {
+    res.status(401).json({ error: 'Invalid authentication token' });
+    return null;
+  }
+}
+
+app.post('/api/client-issues', async (req, res) => {
+  const identity = await verifyConsoleIssueCaller(req, res);
+  if (!identity) return;
+  if (!db) return res.status(503).json({ error: 'Issue storage unavailable' });
+
+  const rateKey = identity.uid;
+  const now = Date.now();
+  if (consoleIssueRateMap.size > 20_000) {
+    for (const [uid, value] of consoleIssueRateMap.entries()) {
+      if (now - value.start > 60_000) consoleIssueRateMap.delete(uid);
+    }
+    while (consoleIssueRateMap.size > 20_000) consoleIssueRateMap.delete(consoleIssueRateMap.keys().next().value);
+  }
+  const rate = consoleIssueRateMap.get(rateKey) || { start: now, count: 0 };
+  if (now - rate.start >= 60_000) { rate.start = now; rate.count = 0; }
+  const body = req.body || {};
+  const reports = Array.isArray(body.issues) ? body.issues : [body];
+  if (!reports.length || reports.length > 20) return res.status(400).json({ error: 'Submit between 1 and 20 issue reports' });
+  if (Buffer.byteLength(JSON.stringify(reports), 'utf8') > 300_000) return res.status(413).json({ error: 'Issue report batch is too large' });
+  rate.count += reports.length;
+  consoleIssueRateMap.set(rateKey, rate);
+  if (rate.count > 60) return res.status(429).json({ error: 'Too many issue reports' });
+
+  if (reports.some((report) => !cleanConsoleIssueText(report?.message, 2000))) {
+    return res.status(400).json({ error: 'Every issue report needs a non-empty error message' });
+  }
+
+  try {
+    const user = await getCachedUser(identity.uid).catch(() => null);
+    const batch = db.batch();
+    const issueCollection = db.collection('ClientConsoleIssues');
+    const entries = reports.map((report) => {
+      const clientIssueId = cleanConsoleIssueText(report.id, 80);
+      const stableDocId = clientIssueId && /^[A-Za-z0-9_-]{1,80}$/.test(clientIssueId)
+        ? crypto.createHash('sha256').update(`${identity.uid}:${clientIssueId}`).digest('hex')
+        : crypto.randomUUID().replace(/-/g, '');
+      return { report, clientIssueId, ref: issueCollection.doc(stableDocId) };
+    });
+    const existingReports = await db.getAll(...entries.map((entry) => entry.ref));
+    let writes = 0;
+    for (let index = 0; index < entries.length; index++) {
+      const { report, clientIssueId, ref } = entries[index];
+      const existing = existingReports[index];
+      if (existing.exists) {
+        if (existing.data()?.reporterUid !== identity.uid) return res.status(409).json({ error: 'Issue report ID collision' });
+        continue;
+      }
+      batch.create(ref, {
+        clientIssueId,
+        reporterUid: identity.uid,
+        reporterName: cleanConsoleIssueText(user?.name || identity.name || '', 100),
+        reporterEmail: cleanConsoleIssueText(identity.email || '', 160),
+        message: cleanConsoleIssueText(report.message, 2000),
+        stack: cleanConsoleIssueText(report.stack, 8000),
+        source: cleanConsoleIssueText(report.source, 120) || 'app',
+        route: cleanConsoleIssueText(report.route, 300),
+        lastAction: cleanConsoleIssueText(report.lastAction, 250),
+        context: cleanConsoleIssueText(report.context, 400),
+        platform: cleanConsoleIssueText(report.platform, 500),
+        status: 'open',
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        clientOccurredAt: cleanConsoleIssueText(report.createdAt, 40),
+      });
+      writes++;
+    }
+    if (writes) await batch.commit();
+    return res.status(201).json({ success: true, count: entries.length, ids: entries.map((entry) => entry.ref.id) });
+  } catch (error) {
+    console.error('[Client Issue] Could not store report:', error.message);
+    return res.status(503).json({ error: 'Issue storage failed; client will retry later' });
+  }
+});
+
+app.get('/api/admin/client-issues', async (req, res) => {
+  const identity = await verifyConsoleIssueCaller(req, res, true);
+  if (!identity) return;
+  if (!db) return res.status(503).json({ error: 'Issue storage unavailable' });
+  try {
+    const snapshot = await db.collection('ClientConsoleIssues').orderBy('createdAt', 'desc').limit(200).get();
+    const issues = snapshot.docs.map((issueDoc) => {
+      const data = issueDoc.data();
+      return {
+        id: issueDoc.id,
+        ...data,
+        createdAt: data.createdAt?.toDate?.().toISOString() || data.clientOccurredAt || '',
+        resolvedAt: data.resolvedAt?.toDate?.().toISOString() || null,
+      };
+    });
+    return res.json({ issues });
+  } catch (error) {
+    console.error('[Client Issue] Admin list failed:', error.message);
+    return res.status(503).json({ error: 'Could not load issue reports' });
+  }
+});
+
+app.patch('/api/admin/client-issues/:issueId', async (req, res) => {
+  const identity = await verifyConsoleIssueCaller(req, res, true);
+  if (!identity) return;
+  if (!db) return res.status(503).json({ error: 'Issue storage unavailable' });
+  const issueId = String(req.params.issueId || '');
+  const status = req.body?.status;
+  if (!/^[A-Za-z0-9_-]{1,150}$/.test(issueId) || !['open', 'resolved'].includes(status)) {
+    return res.status(400).json({ error: 'Invalid issue ID or status' });
+  }
+  try {
+    await db.collection('ClientConsoleIssues').doc(issueId).update({
+      status,
+      resolvedAt: status === 'resolved' ? admin.firestore.FieldValue.serverTimestamp() : null,
+      resolvedBy: identity.uid,
+    });
+    return res.json({ success: true });
+  } catch (error) {
+    if (error.code === 5) return res.status(404).json({ error: 'Issue not found' });
+    console.error('[Client Issue] Admin update failed:', error.message);
+    return res.status(503).json({ error: 'Could not update issue' });
+  }
 });
 
 // ==========================================
