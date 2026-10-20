@@ -237,7 +237,7 @@ async function saveNotification({ userId, title, body, type, targetId, senderNam
 // HELPER: Send FCM and save notifications (MASSIVE PERFORMANCE OVERHAUL)
 // Fully Non-Blocking: Both FCM and Firestore saving happen asynchronously.
 // ==========================================
-async function sendFCMAndSave({ tokens, userIds, title, body, data, type, targetId, senderName, senderAvatar }) {
+async function sendFCMAndSave({ tokens, userIds, title, body, data, type, targetId, senderName, senderAvatar, saveToInbox = true }) {
   const uniqueTokens = [...new Set(tokens || [])];
   const uniqueUserIds = [...new Set(userIds || [])];
 
@@ -260,7 +260,7 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
       const rawData = {
         ...(data || {}), title: title || '', body: body || '', senderName: senderName || '',
         senderAvatar: senderAvatar || '', type: type || 'general', targetId: targetId || '',
-        timestamp: Date.now().toString(), channelId: isIncomingCall ? 'in_shashta_calls_v2' : 'in_shashta_messages_v2',
+        timestamp: Date.now().toString(), channelId: isIncomingCall ? 'in_shashta_calls_v4' : 'in_shashta_messages_v2',
       };
       const stringifiedData = Object.fromEntries(Object.entries(rawData)
         .filter(([, value]) => value !== undefined && value !== null)
@@ -317,6 +317,9 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
   });
 
   const dbPromise = (async () => {
+    // Call signaling is already stored in WebRTCCalls. Duplicating every ring
+    // into Notifications caused stale call entries and extra Firestore writes.
+    if (!saveToInbox) return { saved: 0, error: null };
     if (!db || uniqueUserIds.length === 0) return { saved: 0, error: db ? null : 'firestore-unavailable' };
     let saved = 0;
     try {
@@ -933,15 +936,37 @@ app.post('/api/notify-call', async (req, res) => {
     try { authenticatedUser = await admin.auth().verifyIdToken(bearer[1]); }
     catch { return res.status(401).json({ error: 'Invalid authentication token' }); }
     const { callerId, calleeId, callId } = req.body || {};
-    if (![callerId, calleeId, callId].every(value => typeof value === 'string' && value.length > 0 && value.length <= 160)) {
+    if (typeof callerId !== 'string' || callerId.length < 1 || callerId.length > 128 || callerId.includes('/')
+      || typeof calleeId !== 'string' || calleeId.length < 1 || calleeId.length > 128 || calleeId.includes('/')
+      || typeof callId !== 'string' || callId.length <= 5 || callId.length > 320 || !callId.startsWith('call_') || callId.includes('/')
+      || callerId === calleeId) {
       return res.status(400).json({ error: 'callerId, calleeId, and callId required' });
     }
     if (authenticatedUser.uid !== callerId) return res.status(403).json({ error: 'Caller identity mismatch' });
-    const callSnapshot = await db.collection('WebRTCCalls').doc(String(callId)).get();
-    if (!callSnapshot.exists || callSnapshot.data().callerId !== callerId || callSnapshot.data().calleeId !== calleeId || callSnapshot.data().status !== 'ringing') {
-      return res.status(403).json({ error: 'Invalid call invitation' });
-    }
-    const callData = callSnapshot.data();
+    const callRef = db.collection('WebRTCCalls').doc(callId);
+    const claimId = crypto.randomUUID();
+    const claim = await db.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(callRef);
+      if (!snapshot.exists) return { error: 'invalid' };
+      const call = snapshot.data();
+      if (call.callerId !== callerId || call.calleeId !== calleeId || call.status !== 'ringing') return { error: 'invalid' };
+      const ringingAtMs = call.updatedAt?.toMillis?.();
+      if (!Number.isFinite(ringingAtMs) || Date.now() - ringingAtMs > 45_000) return { error: 'expired' };
+      const sentAtMs = call.callPushSentAt?.toMillis?.();
+      if (Number.isFinite(sentAtMs) && Date.now() - sentAtMs < 45_000) return { duplicate: true };
+      const leaseUntilMs = call.callPushLeaseUntil?.toMillis?.();
+      if (Number.isFinite(leaseUntilMs) && leaseUntilMs > Date.now()) return { pending: true };
+      transaction.update(callRef, {
+        callPushLeaseId: claimId,
+        callPushLeaseUntil: admin.firestore.Timestamp.fromMillis(Date.now() + 15_000),
+      });
+      return { callData: call };
+    });
+    if (claim.error === 'expired') return res.status(410).json({ error: 'Call invitation expired' });
+    if (claim.error || !claim.callData && !claim.duplicate && !claim.pending) return res.status(403).json({ error: 'Invalid call invitation' });
+    if (claim.duplicate) return res.json({ success: true, duplicate: true, sent: 1, failed: 0 });
+    if (claim.pending) return res.status(409).json({ success: false, reason: 'call_push_in_progress', sent: 0 });
+    const callData = claim.callData;
     const callerName = String(callData.callerName || 'مستخدم').slice(0, 64);
     const callerAvatar = String(callData.callerAvatar || '').slice(0, 1024);
 
@@ -949,6 +974,7 @@ app.post('/api/notify-call', async (req, res) => {
 
     const calleeData = await getCachedUser(calleeId);
     if (!calleeData || !calleeData.fcmToken) {
+       await callRef.update({ callPushLeaseId: admin.firestore.FieldValue.delete(), callPushLeaseUntil: admin.firestore.FieldValue.delete() }).catch(() => {});
        console.warn(`[Notify Call] Callee has no registered push token: ${calleeId}`);
        return res.status(409).json({ success: false, reason: 'callee_no_push_token', sent: 0 });
     }
@@ -966,8 +992,19 @@ app.post('/api/notify-call', async (req, res) => {
       type: 'INCOMING_CALL',
       targetId: callerId,
       senderName: callerName || '',
-      senderAvatar: callerAvatar || ''
+      senderAvatar: callerAvatar || '',
+      saveToInbox: false,
     });
+
+    await db.runTransaction(async (transaction) => {
+      const latest = await transaction.get(callRef);
+      if (!latest.exists || latest.data().callPushLeaseId !== claimId) return;
+      transaction.update(callRef, {
+        ...(result.sent > 0 ? { callPushSentAt: admin.firestore.FieldValue.serverTimestamp() } : {}),
+        callPushLeaseId: admin.firestore.FieldValue.delete(),
+        callPushLeaseUntil: admin.firestore.FieldValue.delete(),
+      });
+    }).catch((error) => console.warn('[Notify Call] Could not finalize push claim:', error.code || error.message));
 
     if (result.timedOut || result.sent === 0) {
       console.error(`[Notify Call] Push delivery failed for call ${callId}:`, JSON.stringify(result));
