@@ -127,6 +127,30 @@ const db = admin.apps.length ? admin.firestore() : null;
 // ==========================================
 const CacheStore = new Map();
 const CACHE_TTL = 15000;
+const MAX_CACHE_ENTRIES = 5000;
+
+function getCachedValue(key, now = Date.now()) {
+  const entry = CacheStore.get(key);
+  if (!entry) return undefined;
+  if (now - entry.time >= CACHE_TTL) {
+    CacheStore.delete(key);
+    return undefined;
+  }
+  // Keep frequently used entries at the end of the Map, making eviction LRU.
+  CacheStore.delete(key);
+  CacheStore.set(key, entry);
+  return entry.data;
+}
+
+function setCachedValue(key, data, now = Date.now()) {
+  CacheStore.delete(key);
+  CacheStore.set(key, { data, time: now });
+  while (CacheStore.size > MAX_CACHE_ENTRIES) {
+    const oldestKey = CacheStore.keys().next().value;
+    if (oldestKey === undefined) break;
+    CacheStore.delete(oldestKey);
+  }
+}
 
 // Garbage collection to clean up expired cache items and prevent memory leaks
 const cacheCleanup = setInterval(() => {
@@ -143,15 +167,13 @@ async function getCachedUser(uid) {
   if (!uid) return null;
   const key = `User_${uid}`;
   const now = Date.now();
-  if (CacheStore.has(key)) {
-    const entry = CacheStore.get(key);
-    if (now - entry.time < CACHE_TTL) return entry.data;
-  }
+  const cached = getCachedValue(key, now);
+  if (cached !== undefined) return cached;
   
   if (db) {
     const doc = await db.collection('Users').doc(uid).get();
     if (doc.exists) {
-      CacheStore.set(key, { data: doc.data(), time: now });
+      setCachedValue(key, doc.data(), now);
       return doc.data();
     }
   }
@@ -166,8 +188,9 @@ async function getCachedUsersBatch(userIds) {
   
   userIds.forEach(id => {
     const key = `User_${id}`;
-    if (CacheStore.has(key) && (now - CacheStore.get(key).time < CACHE_TTL)) {
-      result[id] = CacheStore.get(key).data;
+    const cached = getCachedValue(key, now);
+    if (cached !== undefined) {
+      result[id] = cached;
     } else {
       missingIds.push(id);
     }
@@ -182,7 +205,7 @@ async function getCachedUsersBatch(userIds) {
       docs.forEach(doc => {
         if (doc.exists) {
           result[doc.id] = doc.data();
-          CacheStore.set(`User_${doc.id}`, { data: doc.data(), time: now });
+          setCachedValue(`User_${doc.id}`, doc.data(), now);
         }
       });
     }
@@ -193,15 +216,13 @@ async function getCachedUsersBatch(userIds) {
 async function getCachedDoc(collection, docId) {
   const key = `${collection}_${docId}`;
   const now = Date.now();
-  if (CacheStore.has(key)) {
-    const entry = CacheStore.get(key);
-    if (now - entry.time < CACHE_TTL) return entry.data;
-  }
+  const cached = getCachedValue(key, now);
+  if (cached !== undefined) return cached;
   
   if (db) {
     const doc = await db.collection(collection).doc(docId).get();
     if (doc.exists) {
-      CacheStore.set(key, { data: doc.data(), time: now });
+      setCachedValue(key, doc.data(), now);
       return doc.data();
     }
   }
@@ -413,7 +434,21 @@ app.post('/api/notify-message', async (req, res) => {
   try {
     if (!db) return res.status(500).json({ error: 'DB not available' });
     const { matchId, senderId, text } = req.body;
-    if (!matchId || !senderId) return res.status(400).json({ error: 'matchId and senderId required' });
+    const bearer = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i);
+    if (!bearer) return res.status(401).json({ error: 'Firebase authentication required' });
+    let authenticatedUser;
+    try {
+      authenticatedUser = await admin.auth().verifyIdToken(bearer[1]);
+    } catch {
+      return res.status(401).json({ error: 'Invalid or expired Firebase token' });
+    }
+    if (typeof senderId !== 'string' || authenticatedUser.uid !== senderId) {
+      return res.status(403).json({ error: 'Sender identity mismatch' });
+    }
+    if (typeof matchId !== 'string' || matchId.length < 1 || matchId.length > 320 || matchId.includes('/')
+      || typeof text !== 'string' || text.length > 4000) {
+      return res.status(400).json({ error: 'Valid matchId and message text are required' });
+    }
 
     console.log(`\n📨 Notify message: matchId=${matchId}, senderId=${senderId}`);
 
