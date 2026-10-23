@@ -979,12 +979,20 @@ app.post('/api/notify-call', async (req, res) => {
     }
     if (authenticatedUser.uid !== callerId) return res.status(403).json({ error: 'Caller identity mismatch' });
     const callRef = db.collection('WebRTCCalls').doc(callId);
+    const callerRef = db.collection('Users').doc(callerId);
+    const calleeRef = db.collection('Users').doc(calleeId);
     const claimId = crypto.randomUUID();
     const claim = await db.runTransaction(async (transaction) => {
-      const snapshot = await transaction.get(callRef);
+      const [snapshot, callerSnapshot, calleeSnapshot] = await Promise.all([
+        transaction.get(callRef), transaction.get(callerRef), transaction.get(calleeRef),
+      ]);
       if (!snapshot.exists) return { error: 'invalid' };
       const call = snapshot.data();
       if (call.callerId !== callerId || call.calleeId !== calleeId || call.status !== 'ringing') return { error: 'invalid' };
+      const callerBlockedUsers = callerSnapshot.exists ? callerSnapshot.data().blockedUsers : [];
+      const calleeBlockedUsers = calleeSnapshot.exists ? calleeSnapshot.data().blockedUsers : [];
+      if ((Array.isArray(callerBlockedUsers) && callerBlockedUsers.includes(calleeId))
+        || (Array.isArray(calleeBlockedUsers) && calleeBlockedUsers.includes(callerId))) return { error: 'blocked' };
       const ringingAtMs = call.updatedAt?.toMillis?.();
       if (!Number.isFinite(ringingAtMs) || Date.now() - ringingAtMs > 45_000) return { error: 'expired' };
       const sentAtMs = call.callPushSentAt?.toMillis?.();
@@ -997,6 +1005,7 @@ app.post('/api/notify-call', async (req, res) => {
       });
       return { callData: call };
     });
+    if (claim.error === 'blocked') return res.status(403).json({ error: 'Call is blocked' });
     if (claim.error === 'expired') return res.status(410).json({ error: 'Call invitation expired' });
     if (claim.error || !claim.callData && !claim.duplicate && !claim.pending) return res.status(403).json({ error: 'Invalid call invitation' });
     if (claim.duplicate) return res.json({ success: true, duplicate: true, sent: 1, failed: 0 });
@@ -1456,7 +1465,18 @@ app.get('/api/admin/client-issues', async (req, res) => {
   if (!identity) return;
   if (!db) return res.status(503).json({ error: 'Issue storage unavailable' });
   try {
-    const snapshot = await db.collection('ClientConsoleIssues').orderBy('createdAt', 'desc').limit(200).get();
+    const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : '';
+    if (cursor && !/^[A-Za-z0-9_-]{1,150}$/.test(cursor)) {
+      return res.status(400).json({ error: 'Invalid issue cursor' });
+    }
+    const issueCollection = db.collection('ClientConsoleIssues');
+    let issueQuery = issueCollection.orderBy('createdAt', 'desc').limit(200);
+    if (cursor) {
+      const cursorDoc = await issueCollection.doc(cursor).get();
+      if (!cursorDoc.exists) return res.status(400).json({ error: 'Issue cursor no longer exists; refresh the list' });
+      issueQuery = issueQuery.startAfter(cursorDoc);
+    }
+    const snapshot = await issueQuery.get();
     const issues = snapshot.docs.map((issueDoc) => {
       const data = issueDoc.data();
       return {
@@ -1466,7 +1486,7 @@ app.get('/api/admin/client-issues', async (req, res) => {
         resolvedAt: data.resolvedAt?.toDate?.().toISOString() || null,
       };
     });
-    return res.json({ issues });
+    return res.json({ issues, nextCursor: snapshot.size === 200 ? snapshot.docs[snapshot.docs.length - 1].id : null });
   } catch (error) {
     console.error('[Client Issue] Admin list failed:', error.message);
     return res.status(503).json({ error: 'Could not load issue reports' });
