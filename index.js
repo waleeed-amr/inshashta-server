@@ -1019,7 +1019,7 @@ app.post('/api/livekit/token', async (req, res) => {
       roomJoin: true,
       room: roomName,
       canPublishSources: videoUpgradeRoom
-        ? [TrackSource.CAMERA]
+        ? [TrackSource.CAMERA, TrackSource.SCREEN_SHARE, TrackSource.SCREEN_SHARE_AUDIO]
         : [TrackSource.MICROPHONE, TrackSource.CAMERA, TrackSource.SCREEN_SHARE, TrackSource.SCREEN_SHARE_AUDIO],
       canSubscribe: true,
       canPublishData: true,
@@ -1237,7 +1237,8 @@ app.post('/api/notify-call', async (req, res) => {
     }
 
     const title = 'مكالمة واردة';
-    const body = `مكالمة صوتية من ${callerName || 'شخص'}`;
+    const callType = callData.callType === 'video' ? 'video' : 'audio';
+    const body = `${callType === 'video' ? 'مكالمة فيديو' : 'مكالمة صوتية'} من ${callerName || 'شخص'}`;
 
     // Send high-priority FCM Data Message to wake up the app
     const result = await sendFCMAndSave({
@@ -1245,7 +1246,7 @@ app.post('/api/notify-call', async (req, res) => {
       userIds: [calleeId],
       title,
       body,
-      data: { type: 'INCOMING_CALL', callId, callerId, calleeId, callerName: callerName || '', callerAvatar: callerAvatar || '', callType: 'audio' },
+      data: { type: 'INCOMING_CALL', callId, callerId, calleeId, callerName: callerName || '', callerAvatar: callerAvatar || '', callType },
       type: 'INCOMING_CALL',
       targetId: callerId,
       senderName: callerName || '',
