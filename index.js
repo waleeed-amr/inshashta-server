@@ -916,10 +916,13 @@ app.post('/api/livekit/token', async (req, res) => {
 
   const groupId = req.body?.groupId;
   const peerId = req.body?.peerId;
+  const upgradeCallId = req.body?.upgradeCallId;
   const isGroupCall = typeof groupId === 'string';
-  if (isGroupCall === (typeof peerId === 'string')
+  const isUpgradeCall = typeof upgradeCallId === 'string';
+  if ((isGroupCall ? 1 : 0) + (typeof peerId === 'string' ? 1 : 0) + (isUpgradeCall ? 1 : 0) !== 1
     || (isGroupCall && !/^[A-Za-z0-9_-]{1,128}$/.test(groupId))
-    || (!isGroupCall && (typeof peerId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(peerId) || peerId === authenticatedUser.uid))) {
+    || (isUpgradeCall && !/^[A-Za-z0-9_-]{1,160}$/.test(upgradeCallId))
+    || (!isUpgradeCall && !isGroupCall && (typeof peerId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(peerId) || peerId === authenticatedUser.uid))) {
     return res.status(400).json({ error: 'A valid group id or peer id is required' });
   }
 
@@ -939,7 +942,39 @@ app.post('/api/livekit/token', async (req, res) => {
   try {
     let roomName;
     let userSnapshot;
-    if (isGroupCall) {
+    let videoUpgradeRoom = false;
+    if (isUpgradeCall) {
+      const callSnapshot = await db.collection('WebRTCCalls').doc(upgradeCallId).get();
+      if (!callSnapshot.exists || callSnapshot.data()?.status !== 'connected') return res.status(404).json({ error: 'المكالمة الصوتية غير متاحة للفيديو' });
+      const call = callSnapshot.data();
+      const upgradeSnapshot = await db.collection('WebRTCCalls').doc(upgradeCallId).collection('VideoUpgrades').doc('active').get();
+      if (!upgradeSnapshot.exists) return res.status(403).json({ error: 'لا يوجد طلب فيديو لهذه المكالمة' });
+      const upgrade = upgradeSnapshot.data();
+      const isRequester = upgrade.requesterId === authenticatedUser.uid;
+      const isPeer = upgrade.peerId === authenticatedUser.uid;
+      if ((!isRequester && !isPeer)
+        || (isRequester && !['requested', 'accepted'].includes(upgrade.status))
+        || (isPeer && upgrade.status !== 'accepted')
+        || ![call.callerId, call.calleeId].includes(authenticatedUser.uid)
+        || ![call.callerId, call.calleeId].includes(upgrade.peerId)
+        || ![call.callerId, call.calleeId].includes(upgrade.requesterId)) {
+        return res.status(403).json({ error: 'طلب الفيديو لم تتم الموافقة عليه أو لم يعد متاحًا' });
+      }
+      const upgradePeerId = upgrade.peerId === authenticatedUser.uid ? upgrade.requesterId : upgrade.peerId;
+      const [profileSnapshot, peerSnapshot] = await Promise.all([
+        db.collection('Users').doc(authenticatedUser.uid).get(),
+        db.collection('Users').doc(upgradePeerId).get(),
+      ]);
+      const peerData = peerSnapshot.data();
+      const blocks = profileSnapshot.exists ? profileSnapshot.data()?.blockedUsers : [];
+      if ((Array.isArray(blocks) && blocks.includes(upgradePeerId))
+        || (Array.isArray(peerData?.blockedUsers) && peerData.blockedUsers.includes(authenticatedUser.uid))) {
+        return res.status(403).json({ error: 'Calls are unavailable between these users' });
+      }
+      roomName = `upgrade-${upgradeCallId}`;
+      userSnapshot = profileSnapshot;
+      videoUpgradeRoom = true;
+    } else if (isGroupCall) {
       const [groupSnapshot, profileSnapshot] = await Promise.all([
         db.collection('Groups').doc(groupId).get(),
         db.collection('Users').doc(authenticatedUser.uid).get(),
@@ -983,7 +1018,9 @@ app.post('/api/livekit/token', async (req, res) => {
     accessToken.addGrant({
       roomJoin: true,
       room: roomName,
-      canPublishSources: [TrackSource.MICROPHONE, TrackSource.CAMERA, TrackSource.SCREEN_SHARE, TrackSource.SCREEN_SHARE_AUDIO],
+      canPublishSources: videoUpgradeRoom
+        ? [TrackSource.CAMERA]
+        : [TrackSource.MICROPHONE, TrackSource.CAMERA, TrackSource.SCREEN_SHARE, TrackSource.SCREEN_SHARE_AUDIO],
       canSubscribe: true,
       canPublishData: true,
     });
