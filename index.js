@@ -5,6 +5,10 @@ const multer = require('multer');
 const axios = require('axios');
 const ImageKit = require('imagekit');
 const crypto = require('crypto');
+// Keep these as static imports so Vercel's function tracer includes the
+// LiveKit SDK packages in the deployed serverless bundle.
+const { AccessToken } = require('livekit-server-sdk');
+const { TrackSource } = require('@livekit/protocol');
 require('dotenv').config();
 
 // ==========================================
@@ -1004,10 +1008,6 @@ app.post('/api/livekit/token', async (req, res) => {
       userSnapshot = profileSnapshot;
     }
 
-    const [{ AccessToken }, { TrackSource }] = await Promise.all([
-      import('livekit-server-sdk'),
-      import('@livekit/protocol'),
-    ]);
     const userData = userSnapshot.exists ? userSnapshot.data() : {};
     const participantName = String(userData.name || userData.displayName || authenticatedUser.name || 'مستخدم').slice(0, 80);
     const accessToken = new AccessToken(apiKey, apiSecret, {
