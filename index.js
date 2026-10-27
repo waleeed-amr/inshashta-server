@@ -1775,61 +1775,72 @@ app.post('/api/admin/reset-password', asyncHandler(async (req, res) => {
 }));
 
 // ==========================================
-// 12b. Self-Service: Device-Verified Password Reset (AI-Supervised)
+// 12b. Self-Service: Device-Verified Password Reset
 // ==========================================
 app.post('/api/recover-account', asyncHandler(async (req, res) => {
   if (!db) return res.status(500).json({ error: 'DB not available' });
 
-  const { phone, deviceId, newPassword } = req.body;
-  if (!phone || !deviceId || !newPassword) {
-    return res.status(400).json({ error: 'phone, deviceId and newPassword are required' });
+  const { mode, phone, deviceId, newPassword, recoveryToken } = req.body || {};
+  if (!['verify', 'reset'].includes(mode) || typeof phone !== 'string') {
+    return res.status(400).json({ error: 'invalid_request', message: 'طلب استعادة غير صالح' });
   }
-  if (newPassword.length < 6) {
-    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  if (mode === 'verify' && (typeof deviceId !== 'string' || deviceId.length < 4 || deviceId.length > 256)) {
+    return res.status(400).json({ error: 'invalid_device', message: 'تعذر التحقق من هذا الجهاز' });
+  }
+  if (mode === 'reset' && (typeof newPassword !== 'string' || newPassword.length < 6 || typeof recoveryToken !== 'string' || recoveryToken.length < 32 || recoveryToken.length > 256)) {
+    return res.status(400).json({ error: 'invalid_recovery', message: 'انتهت جلسة التحقق. ابدأ الاستعادة من جديد.' });
   }
 
   const cleanPhone = phone.trim().replace(/[\s-]/g, '');
+  if (!cleanPhone || cleanPhone.length > 40) return res.status(400).json({ error: 'invalid_phone', message: 'رقم الهاتف غير صالح' });
   const fakeEmail = `${cleanPhone}@inshashta.app`;
 
-  console.log(`\n🔐 Self-service recovery for: ${cleanPhone}, deviceId: ${deviceId.slice(0, 10)}...`);
-
   try {
-    // 1. Find user in Firebase Auth
     const userRecord = await admin.auth().getUserByEmail(fakeEmail);
+    if (mode === 'verify') {
+      const userDoc = await db.collection('Users').doc(userRecord.uid).get();
+      if (!userDoc.exists) return res.status(404).json({ error: 'user_not_found', message: 'لا يوجد حساب مرتبط بهذا الرقم' });
+      const userData = userDoc.data() || {};
+      const normalizeDeviceId = (value) => typeof value === 'string' ? value.trim().toLowerCase() : '';
+      if (!normalizeDeviceId(userData.deviceId)) {
+        return res.status(403).json({ error: 'no_device_registered', message: 'لا يوجد جهاز مسجل للحساب. تواصل مع الدعم لاستعادة آمنة.' });
+      }
+      if (normalizeDeviceId(userData.deviceId) !== normalizeDeviceId(deviceId)) {
+        return res.status(403).json({ error: 'device_mismatch', message: 'معرّف هذا الجهاز لا يطابق الجهاز المسجل. تواصل مع الدعم لاستعادة آمنة.' });
+      }
 
-    // 2. Look up user in Firestore to check device
-    const userDoc = await db.collection('Users').doc(userRecord.uid).get();
-    if (!userDoc.exists) {
-      return res.status(404).json({ error: 'user_not_found', message: 'لا يوجد حساب مرتبط بهذا الرقم' });
-    }
-
-    const userData = userDoc.data();
-
-    // 3. Compare deviceId
-    if (!userData.deviceId) {
-      return res.status(403).json({ 
-        error: 'no_device_registered',
-        message: 'لم يتم تسجيل جهاز لهذا الحساب. تواصل مع الأدمن لاستعادة الحساب.'
+      // Verification must never change the password. Return a short-lived,
+      // one-use token so the following reset request is bound to this check.
+      const priorChallenges = await db.collection('PasswordRecoveryChallenges').where('uid', '==', userRecord.uid).get();
+      if (!priorChallenges.empty) {
+        const batch = db.batch();
+        priorChallenges.docs.forEach((document) => batch.delete(document.ref));
+        await batch.commit();
+      }
+      const recoveryToken = crypto.randomBytes(32).toString('hex');
+      const tokenHash = crypto.createHash('sha256').update(recoveryToken).digest('hex');
+      await db.collection('PasswordRecoveryChallenges').doc(tokenHash).set({
+        uid: userRecord.uid,
+        phone: cleanPhone,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        expiresAt: new Date(Date.now() + 10 * 60 * 1000),
       });
+      return res.json({ success: true, recoveryToken, userName: userData.name || '' });
     }
 
-    if (userData.deviceId !== deviceId) {
-      console.log(`❌ Device mismatch! Stored: ${userData.deviceId?.slice(0, 10)}, Provided: ${deviceId.slice(0, 10)}`);
-      return res.status(403).json({ 
-        error: 'device_mismatch',
-        message: 'هذا الجهاز لا يتطابق مع الجهاز المسجل في الحساب. تواصل مع الأدمن.'
-      });
+    const tokenHash = crypto.createHash('sha256').update(recoveryToken).digest('hex');
+    const challengeRef = db.collection('PasswordRecoveryChallenges').doc(tokenHash);
+    const challengeSnapshot = await challengeRef.get();
+    const challenge = challengeSnapshot.exists ? challengeSnapshot.data() : null;
+    const expiry = challenge?.expiresAt?.toMillis?.() ?? new Date(challenge?.expiresAt || 0).getTime();
+    if (!challenge || challenge.uid !== userRecord.uid || challenge.phone !== cleanPhone || !Number.isFinite(expiry) || expiry <= Date.now()) {
+      if (challengeSnapshot.exists) await challengeRef.delete().catch(() => {});
+      return res.status(403).json({ error: 'recovery_expired', message: 'انتهت جلسة التحقق. ابدأ الاستعادة من جديد.' });
     }
-
-    // 4. Device matches! Reset password
     await admin.auth().updateUser(userRecord.uid, { password: newPassword });
-
-    console.log(`✅ Self-service recovery successful for UID: ${userRecord.uid}`);
-    res.json({ 
-      success: true, 
-      message: 'تم إعادة تعيين كلمة المرور بنجاح!',
-      userName: userData.name || ''
-    });
+    await challengeRef.delete();
+    const userDoc = await db.collection('Users').doc(userRecord.uid).get();
+    return res.json({ success: true, message: 'تم إعادة تعيين كلمة المرور بنجاح!', userName: userDoc.data()?.name || '' });
   } catch (err) {
     if (err.code === 'auth/user-not-found') {
       return res.status(404).json({ error: 'user_not_found', message: 'لا يوجد حساب مرتبط بهذا الرقم' });
