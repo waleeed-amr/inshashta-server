@@ -110,6 +110,7 @@ const upload = multer({
 });
 
 // Initialize Firebase Admin
+let notificationReplySigningSecret = '';
 try {
   let serviceAccount;
   if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
@@ -118,12 +119,44 @@ try {
     serviceAccount = require('./app-loction-5-firebase-adminsdk-fbsvc-d43e43975e.json');
   }
   admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+  notificationReplySigningSecret = process.env.NOTIFICATION_REPLY_SIGNING_SECRET
+    || serviceAccount.private_key
+    || '';
   console.log('✅ Firebase Admin SDK initialized.');
 } catch (e) {
   console.error('❌ Firebase init failed:', e.message);
 }
 
 const db = admin.apps.length ? admin.firestore() : null;
+
+function createNotificationReplyToken(userId, matchId) {
+  if (!notificationReplySigningSecret) return '';
+  const payload = Buffer.from(JSON.stringify({
+    uid: userId,
+    matchId,
+    exp: Date.now() + 24 * 60 * 60 * 1000,
+  })).toString('base64url');
+  const signature = crypto.createHmac('sha256', notificationReplySigningSecret).update(payload).digest('base64url');
+  return `${payload}.${signature}`;
+}
+
+function verifyNotificationReplyToken(token, matchId) {
+  if (typeof token !== 'string' || !notificationReplySigningSecret) return null;
+  const [payload, signature, extra] = token.split('.');
+  if (!payload || !signature || extra !== undefined) return null;
+  const expected = crypto.createHmac('sha256', notificationReplySigningSecret).update(payload).digest();
+  let actual;
+  try { actual = Buffer.from(signature, 'base64url'); } catch { return null; }
+  if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) return null;
+  try {
+    const claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    if (typeof claims.uid !== 'string' || !claims.uid || claims.matchId !== matchId
+      || !Number.isFinite(claims.exp) || claims.exp < Date.now()) return null;
+    return claims;
+  } catch {
+    return null;
+  }
+}
 
 // ==========================================
 // SMART IN-MEMORY CACHE (LRU) FOR RAPID MESSAGING
@@ -265,8 +298,15 @@ async function saveNotification({ userId, title, body, type, targetId, senderNam
 async function sendFCMAndSave({ tokens, userIds, title, body, data, type, targetId, senderName, senderAvatar, saveToInbox = true }) {
   const uniqueTokens = [...new Set(tokens || [])];
   const uniqueUserIds = [...new Set(userIds || [])];
+  const isAccountScopedMessage = ['dm_message', 'group_message', 'chat_message', 'delete_message'].includes(type);
+  const replyRecipients = isAccountScopedMessage
+    ? (tokens || []).map((token, index) => ({ token, userId: userIds?.[index] || '' })).filter(({ token }) => Boolean(token))
+    : [];
+  const deliveryTargets = isAccountScopedMessage
+    ? replyRecipients
+    : uniqueTokens.map((token) => ({ token, userId: '' }));
 
-  if (uniqueTokens.length === 0) {
+  if (deliveryTargets.length === 0) {
     console.log('⚠️ No tokens to send to');
     return { sent: 0, failed: 0, saved: 0, timedOut: false, errors: [] };
   }
@@ -274,12 +314,12 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
   const fcmPromise = (async () => {
     const CHUNK_SIZE = 500;
     const chunks = [];
-    for (let i = 0; i < uniqueTokens.length; i += CHUNK_SIZE) chunks.push(uniqueTokens.slice(i, i + CHUNK_SIZE));
+    for (let i = 0; i < deliveryTargets.length; i += CHUNK_SIZE) chunks.push(deliveryTargets.slice(i, i + CHUNK_SIZE));
     const invalidUserIds = new Set();
     const errors = [];
     let totalSent = 0;
     let totalFailed = 0;
-    const sends = chunks.map(async (tokenChunk, chunkIndex) => {
+    const sends = chunks.map(async (recipientChunk, chunkIndex) => {
       const threadId = targetId || 'inshashta_general';
       const isIncomingCall = type === 'INCOMING_CALL';
       const rawData = {
@@ -291,7 +331,6 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
         .filter(([, value]) => value !== undefined && value !== null)
         .map(([key, value]) => [key, String(value)]));
       const payload = {
-        data: stringifiedData,
         android: {
           priority: 'high',
           ttl: isIncomingCall ? 45_000 : 86_400_000,
@@ -305,9 +344,20 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
           },
           payload: { aps: { contentAvailable: true, sound: 'default', 'thread-id': threadId, alert: { title, body } } },
         },
-        tokens: tokenChunk,
       };
-      const response = await admin.messaging().sendEachForMulticast(payload);
+      const response = isAccountScopedMessage
+        ? await admin.messaging().sendEach(recipientChunk.map(({ token, userId }) => ({
+            ...payload,
+            token,
+            data: {
+              ...stringifiedData,
+              recipientUserId: userId,
+              ...(type === 'delete_message' ? {} : {
+                replyToken: createNotificationReplyToken(userId, String(targetId || data?.matchId || '')),
+              }),
+            },
+          })))
+        : await admin.messaging().sendEachForMulticast({ ...payload, data: stringifiedData, tokens: recipientChunk.map(({ token }) => token) });
       totalSent += response.successCount;
       totalFailed += response.failureCount;
       response.responses.forEach((item, idx) => {
@@ -315,7 +365,9 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
         const code = item.error?.code || 'messaging/unknown-error';
         if (!errors.includes(code) && errors.length < 8) errors.push(code);
         if (code === 'messaging/invalid-registration-token' || code === 'messaging/registration-token-not-registered') {
-          const userId = uniqueUserIds[chunkIndex * CHUNK_SIZE + idx];
+          const userId = isAccountScopedMessage
+            ? recipientChunk[idx]?.userId
+            : uniqueUserIds[chunkIndex * CHUNK_SIZE + idx];
           if (userId) invalidUserIds.add(userId);
         }
       });
@@ -334,11 +386,11 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
         catch (error) { console.warn('[FCM] Could not remove invalid token for user:', uid, error.code || error.message); }
       }
     }
-    console.log(`[FCM] ${type || 'general'} delivered ${totalSent}/${uniqueTokens.length}; failed=${totalFailed}`);
+    console.log(`[FCM] ${type || 'general'} delivered ${totalSent}/${deliveryTargets.length}; failed=${totalFailed}`);
     return { sent: totalSent, failed: totalFailed, errors };
   })().catch((error) => {
     console.error('[FCM] Sending failed:', error.code || error.message);
-    return { sent: 0, failed: uniqueTokens.length, errors: [error.code || 'messaging/request-failed'] };
+    return { sent: 0, failed: deliveryTargets.length, errors: [error.code || 'messaging/request-failed'] };
   });
 
   const dbPromise = (async () => {
@@ -819,18 +871,21 @@ app.post('/api/notify-chat-reaction', async (req, res) => {
 app.post('/api/reply-message', async (req, res) => {
   try {
     if (!db) return res.status(500).json({ error: 'DB not available' });
-    const { matchId, senderId, text } = req.body;
-    if (!matchId || !senderId || !text) {
-      return res.status(400).json({ error: 'matchId, senderId and text required' });
+    const { matchId, replyToken, text } = req.body;
+    if (typeof matchId !== 'string' || !matchId || matchId.length > 320 || typeof text !== 'string' || !text.trim() || text.length > 4000) {
+      return res.status(400).json({ error: 'Valid matchId and message text are required' });
     }
+    const claims = verifyNotificationReplyToken(replyToken, matchId);
+    if (!claims) return res.status(401).json({ error: 'Invalid or expired notification reply token' });
+    const senderId = claims.uid;
 
-    console.log(`\n💬 Inline reply: matchId=${matchId}, senderId=${senderId}, text=${text}`);
+    console.log(`\n💬 Inline reply: matchId=${matchId}, senderId=${senderId}`);
 
     // 1. Save the message to Firestore
     await db.collection('Messages').add({
       matchId,
       senderId,
-      text,
+      text: text.trim(),
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       readBy: [senderId]
     });
