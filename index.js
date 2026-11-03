@@ -163,9 +163,8 @@ function verifyNotificationReplyToken(token, matchId) {
 // Automatically clears after 15 seconds. Drops DB reads to ~0 during fast texting.
 // ==========================================
 const CacheStore = new Map();
-// Keep hot user/group/token lookups warm across quick follow-up messages.
-// Invalid FCM tokens are still removed on send failures as before.
-const CACHE_TTL = 60000;
+// Short cache window keeps active chats warm without retaining stale FCM tokens too long.
+const CACHE_TTL = 15000;
 const MAX_CACHE_ENTRIES = 5000;
 
 function getCachedValue(key, now = Date.now()) {
@@ -347,8 +346,8 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
           payload: { aps: { contentAvailable: true, sound: 'default', 'thread-id': threadId, alert: { title, body } } },
         },
       };
-      const response = isAccountScopedMessage
-        ? await admin.messaging().sendEach(recipientChunk.map(({ token, userId }) => ({
+      const scopedMessages = isAccountScopedMessage
+        ? recipientChunk.map(({ token, userId }) => ({
             ...payload,
             token,
             data: {
@@ -358,7 +357,27 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
                 replyToken: createNotificationReplyToken(userId, String(targetId || data?.matchId || '')),
               }),
             },
-          })))
+          }))
+        : null;
+      // A direct chat normally has one recipient. Use the single-token FCM
+      // endpoint there instead of the sendEach batch path.
+      if (scopedMessages?.length === 1) {
+        try {
+          await admin.messaging().send(scopedMessages[0]);
+          totalSent += 1;
+        } catch (error) {
+          totalFailed += 1;
+          const code = error?.code || 'messaging/request-failed';
+          if (!errors.includes(code) && errors.length < 8) errors.push(code);
+          if (code === 'messaging/invalid-registration-token' || code === 'messaging/registration-token-not-registered') {
+            const uid = recipientChunk[0]?.userId;
+            if (uid) invalidUserIds.add(uid);
+          }
+        }
+        return;
+      }
+      const response = isAccountScopedMessage
+        ? await admin.messaging().sendEach(scopedMessages)
         : await admin.messaging().sendEachForMulticast({ ...payload, data: stringifiedData, tokens: recipientChunk.map(({ token }) => token) });
       totalSent += response.successCount;
       totalFailed += response.failureCount;
@@ -520,9 +539,11 @@ app.post('/api/notify-message', async (req, res) => {
     // The sender profile and the DM recipient token are independent reads.
     // Fetch them together so a cold Firestore cache doesn't add two network
     // round trips to every first message in a conversation.
-    const [senderData, directRecipientData] = await Promise.all([
+    const [senderData, directRecipientData, resolvedGroupData, resolvedMatchData] = await Promise.all([
       getCachedUser(senderId),
       directRecipientId ? getCachedUser(directRecipientId) : Promise.resolve(null),
+      isGroup ? getCachedDoc('Groups', matchId.replace('group_', '')) : Promise.resolve(null),
+      !isDM && !isGroup ? getCachedDoc('Matches', matchId) : Promise.resolve(null),
     ]);
     let senderName = senderData ? senderData.name : 'User';
     const isSenderVerified = senderData && (senderData.isVerified === true || (Array.isArray(senderData.badges) && senderData.badges.includes('verified')));
@@ -547,7 +568,7 @@ app.post('/api/notify-message', async (req, res) => {
     } else if (isGroup) {
       // Group Chat: get all members' tokens via Batch Cache
       const groupId = matchId.replace('group_', '');
-      const groupData = await getCachedDoc('Groups', groupId);
+      const groupData = resolvedGroupData;
       if (!groupData) return res.json({ success: true, sent: 0, reason: 'Group not found' });
       chatName = groupData.name || 'Group';
 
@@ -563,7 +584,7 @@ app.post('/api/notify-message', async (req, res) => {
       }
     } else {
       // Match Chat: get all players' tokens via Batch Cache
-      const matchData = await getCachedDoc('Matches', matchId);
+      const matchData = resolvedMatchData;
       if (!matchData) return res.json({ success: true, sent: 0, reason: 'Match not found' });
       chatName = matchData.name || 'Match';
 
