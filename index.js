@@ -141,7 +141,7 @@ function createNotificationReplyToken(userId, matchId) {
 }
 
 function verifyNotificationReplyToken(token, matchId) {
-  if (typeof token !== 'string' || !notificationReplySigningSecret) return null;
+  if (typeof token !== 'string' || token.length > 2048 || !notificationReplySigningSecret) return null;
   const [payload, signature, extra] = token.split('.');
   if (!payload || !signature || extra !== undefined) return null;
   const expected = crypto.createHmac('sha256', notificationReplySigningSecret).update(payload).digest();
@@ -300,7 +300,7 @@ async function sendFCMAndSave({ tokens, userIds, title, body, data, type, target
   const uniqueUserIds = [...new Set(userIds || [])];
   const isAccountScopedMessage = ['dm_message', 'group_message', 'chat_message', 'delete_message'].includes(type);
   const replyRecipients = isAccountScopedMessage
-    ? (tokens || []).map((token, index) => ({ token, userId: userIds?.[index] || '' })).filter(({ token }) => Boolean(token))
+    ? (tokens || []).map((token, index) => ({ token, userId: userIds?.[index] || '' })).filter(({ token, userId }) => Boolean(token && userId))
     : [];
   const deliveryTargets = isAccountScopedMessage
     ? replyRecipients
