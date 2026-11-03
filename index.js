@@ -163,7 +163,9 @@ function verifyNotificationReplyToken(token, matchId) {
 // Automatically clears after 15 seconds. Drops DB reads to ~0 during fast texting.
 // ==========================================
 const CacheStore = new Map();
-const CACHE_TTL = 15000;
+// Keep hot user/group/token lookups warm across quick follow-up messages.
+// Invalid FCM tokens are still removed on send failures as before.
+const CACHE_TTL = 60000;
 const MAX_CACHE_ENTRIES = 5000;
 
 function getCachedValue(key, now = Date.now()) {
@@ -487,6 +489,7 @@ app.get('/api/imagekit-auth', (req, res) => {
 // 1. Notify Message - Chat, DM & Group notifications
 // ==========================================
 app.post('/api/notify-message', async (req, res) => {
+  const requestStartedAt = Date.now();
   try {
     if (!db) return res.status(500).json({ error: 'DB not available' });
     const { matchId, senderId, text } = req.body;
@@ -523,11 +526,6 @@ app.post('/api/notify-message', async (req, res) => {
     ]);
     let senderName = senderData ? senderData.name : 'User';
     const isSenderVerified = senderData && (senderData.isVerified === true || (Array.isArray(senderData.badges) && senderData.badges.includes('verified')));
-    
-    // Add verification badge directly to the sender name so it appears perfectly in Android/iOS push notifications
-    if (isSenderVerified) {
-      senderName = senderName + ' ✅';
-    }
     
     const senderAvatar = senderData ? (senderData.avatarUrl || '') : '';
 
@@ -585,6 +583,8 @@ app.post('/api/notify-message', async (req, res) => {
     const body = isDM ? (text || 'Sent a message') : `${senderName}: ${text || 'Sent a message'}`;
     const msgType = isDM ? 'dm_message' : (isGroup ? 'group_message' : 'chat_message');
 
+    console.info(`[Notify Message] recipients ready in ${Date.now() - requestStartedAt}ms; type=${msgType}; count=${tokens.length}`);
+
     const result = await sendFCMAndSave({
       tokens,
       userIds,
@@ -597,6 +597,7 @@ app.post('/api/notify-message', async (req, res) => {
       senderAvatar
     });
 
+    console.info(`[Notify Message] request finished in ${Date.now() - requestStartedAt}ms; sent=${result.sent}; failed=${result.failed}`);
     res.json({ success: true, ...result });
   } catch (err) {
     console.error('[Notify Message Error]', err.message);
