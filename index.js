@@ -1119,6 +1119,7 @@ app.post('/api/livekit/invite', async (req, res) => {
   const groupId = req.body?.groupId;
   const peerId = req.body?.peerId;
   const isGroupCall = typeof groupId === 'string';
+  const mediaType = isGroupCall && req.body?.mediaType !== 'video' ? 'audio' : 'video';
   if (isGroupCall === (typeof peerId === 'string')
     || (isGroupCall && !/^[A-Za-z0-9_-]{1,128}$/.test(groupId))
     || (!isGroupCall && (typeof peerId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(peerId) || peerId === caller.uid))) {
@@ -1156,26 +1157,43 @@ app.post('/api/livekit/invite', async (req, res) => {
     const recipientSnapshots = await Promise.all(recipientIds.map((uid) => db.collection('Users').doc(uid).get()));
     const invitees = recipientSnapshots.map((snapshot, index) => ({ uid: recipientIds[index], data: snapshot.exists ? snapshot.data() : {} }));
     const registeredInvitees = invitees.filter(({ data }) => typeof data.fcmToken === 'string' && data.fcmToken.length > 0);
+    const notificationType = isGroupCall ? 'LIVEKIT_GROUP_CALL' : 'LIVEKIT_VIDEO_CALL';
     const result = await sendFCMAndSave({
       tokens: registeredInvitees.map(({ data }) => data.fcmToken),
       userIds: registeredInvitees.map(({ uid }) => uid),
-      title: isGroupCall ? 'مكالمة فيديو جماعية' : 'مكالمة فيديو واردة',
-      body: isGroupCall ? `${callerData.name || caller.name || 'عضو'} بدأ مكالمة فيديو في المجموعة` : `مكالمة فيديو من ${callerData.name || caller.name || 'مستخدم'}`,
-      data: { type: 'LIVEKIT_VIDEO_CALL', matchId, callType: isGroupCall ? 'group' : 'direct', callerId: caller.uid },
-      type: 'LIVEKIT_VIDEO_CALL',
+      title: isGroupCall ? `مكالمة ${mediaType === 'video' ? 'فيديو' : 'صوتية'} جماعية` : `مكالمة ${mediaType === 'video' ? 'فيديو' : 'صوتية'} واردة`,
+      body: isGroupCall ? `${callerData.name || caller.name || 'عضو'} بدأ مكالمة ${mediaType === 'video' ? 'فيديو' : 'صوتية'} في المجموعة` : `مكالمة ${mediaType === 'video' ? 'فيديو' : 'صوتية'} من ${callerData.name || caller.name || 'مستخدم'}`,
+      data: { type: notificationType, matchId, callType: isGroupCall ? 'group' : 'direct', mediaType, callerId: caller.uid },
+      type: notificationType,
       targetId: matchId,
       senderName: String(callerData.name || caller.name || 'مستخدم').slice(0, 64),
       senderAvatar: String(callerData.avatarUrl || '').slice(0, 1024),
     });
     const inviteData = {
-      title: isGroupCall ? 'مكالمة فيديو جماعية' : 'مكالمة فيديو واردة',
-      body: isGroupCall ? `${callerData.name || caller.name || 'عضو'} بدأ مكالمة فيديو في المجموعة` : `مكالمة فيديو من ${callerData.name || caller.name || 'مستخدم'}`,
-      type: 'LIVEKIT_VIDEO_CALL', targetId: matchId,
+      title: isGroupCall ? `مكالمة ${mediaType === 'video' ? 'فيديو' : 'صوتية'} جماعية` : `مكالمة ${mediaType === 'video' ? 'فيديو' : 'صوتية'} واردة`,
+      body: isGroupCall ? `${callerData.name || caller.name || 'عضو'} بدأ مكالمة ${mediaType === 'video' ? 'فيديو' : 'صوتية'} في المجموعة` : `مكالمة ${mediaType === 'video' ? 'فيديو' : 'صوتية'} من ${callerData.name || caller.name || 'مستخدم'}`,
+      type: notificationType, targetId: matchId,
       senderName: String(callerData.name || caller.name || 'مستخدم').slice(0, 64),
       senderAvatar: String(callerData.avatarUrl || '').slice(0, 1024),
       read: false,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     };
+    if (isGroupCall) {
+      const messageId = `group-call-${crypto.randomUUID()}`;
+      const eventMessage = {
+        matchId,
+        senderId: caller.uid,
+        senderName: String(callerData.name || caller.name || 'عضو').slice(0, 80),
+        type: 'group_call',
+        callMediaType: mediaType,
+        groupId,
+        text: `${callerData.name || caller.name || 'عضو'} بدأ مكالمة ${mediaType === 'video' ? 'فيديو' : 'صوتية'} جماعية`,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        readBy: [caller.uid],
+      };
+      await db.collection('Messages').doc(messageId).set(eventMessage);
+      await db.collection('LastMessages').doc(matchId).set(eventMessage, { merge: true });
+    }
     const unregisteredInvitees = invitees.filter(({ data }) => !(typeof data.fcmToken === 'string' && data.fcmToken.length > 0));
     for (let offset = 0; offset < unregisteredInvitees.length; offset += 400) {
       const batch = db.batch();
